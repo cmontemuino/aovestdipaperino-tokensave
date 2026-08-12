@@ -81,6 +81,24 @@ impl TokenSave {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
         });
+        // Exact-phrase evidence outranks the kind heuristic. The sort above is
+        // tier-first by design, so a `const` can never beat a function however
+        // well it scores — which is right for a name query and wrong for a
+        // quoted phrase, where the one symbol whose text actually contains the
+        // phrase is the answer. A UI string lives in a catalog, not a function,
+        // and was being buried under hundreds of generic matches it shared not
+        // one word with (#362). Prepend before truncation so the hit survives
+        // the limit; ordinary single-word searches are untouched, since
+        // `search_nodes_phrase` returns nothing for them.
+        let phrase_hits = self.db.search_nodes_phrase(trimmed_query, limit).await?;
+        if !phrase_hits.is_empty() {
+            let promoted: HashSet<String> = phrase_hits.iter().map(|r| r.node.id.clone()).collect();
+            ranked.retain(|r| !promoted.contains(&r.node.id));
+            let mut merged = phrase_hits;
+            merged.append(&mut ranked);
+            ranked = merged;
+        }
+
         ranked.truncate(limit);
         Ok(ranked)
     }
@@ -394,6 +412,14 @@ impl TokenSave {
         qm.find_circular_dependencies().await
     }
 
+    /// Builds the module-level import graph at the given grouping depth (#334).
+    pub async fn build_module_import_graph(
+        &self,
+        depth: usize,
+    ) -> Result<crate::graph::imports::ModuleImportGraph> {
+        self.db.build_module_import_graph(depth).await
+    }
+
     /// Builds an AI-ready context for a given task description.
     pub async fn build_context(
         &self,
@@ -407,6 +433,11 @@ impl TokenSave {
     /// Returns all indexed file records.
     pub async fn get_all_files(&self) -> Result<Vec<FileRecord>> {
         self.db.get_all_files().await
+    }
+
+    /// Returns only the source-file records, excluding tracked artifacts (#323).
+    pub async fn get_code_files(&self) -> Result<Vec<FileRecord>> {
+        self.db.get_code_files().await
     }
 
     /// Returns the `#[derive(...)]` names attached to the given node.
@@ -752,6 +783,16 @@ impl TokenSave {
         &self.project_root
     }
 
+    /// Whether per-call savings should be surfaced to the agent (#356).
+    ///
+    /// Resolves `report_savings` from the project config, letting the
+    /// `TOKENSAVE_REPORT_SAVINGS` env var override it per-run. Accounting to
+    /// the global DB happens regardless — this governs only what the agent is
+    /// shown and asked to narrate.
+    pub fn report_savings(&self) -> bool {
+        crate::config::env_bool_override("TOKENSAVE_REPORT_SAVINGS", self.config.report_savings)
+    }
+
     /// Recompute the on-disk path to the `SQLite` DB this instance is
     /// serving. Useful for diagnostics (e.g. WAL/SHM size sampling) —
     /// returns the same path that `Database::open` was called with.
@@ -812,6 +853,7 @@ pub(crate) async fn resolve_symbol_for_edit(cg: &TokenSave, symbol: &str) -> Res
                 n.kind,
                 NodeKind::Function
                     | NodeKind::Method
+                    | NodeKind::SingletonMethod
                     | NodeKind::StructMethod
                     | NodeKind::Constructor
                     | NodeKind::AbstractMethod

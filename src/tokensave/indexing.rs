@@ -2,6 +2,19 @@
 use super::query::resolve_symbol_for_edit;
 use super::*;
 
+const RUBY_SINGLETON_KIND_METADATA: &str = "ruby_singleton_method_kind_v1";
+
+fn legacy_ruby_repair_complete(
+    repair_required: bool,
+    scheduled: &[String],
+    extracted: &HashSet<&str>,
+) -> bool {
+    !repair_required
+        || scheduled
+            .iter()
+            .all(|path| extracted.contains(path.as_str()))
+}
+
 /// Extensions that are never source code — binary assets, media, archives,
 /// lockfiles, and plain-data formats. These are excluded from the
 /// skipped-extension diagnostic (#262, #270) so a verbose sync highlights
@@ -281,9 +294,12 @@ impl TokenSave {
         write_dirty_sentinel(&self.project_root);
         let start = Instant::now();
 
-        // 1. Clear existing data and enter bulk-load mode
-        self.db.clear().await?;
+        // 1. Enter bulk-load mode, then clear existing data. Order matters:
+        // `begin_bulk_load` can fail while another process holds the table
+        // lock, and clearing first would leave the project with an empty index
+        // that the MCP server then keeps serving (#320).
         self.db.begin_bulk_load().await?;
+        self.db.clear().await?;
 
         // 2. Scan for source files
         let phase_start = Instant::now();
@@ -302,6 +318,7 @@ impl TokenSave {
 
         let phase_start = Instant::now();
         crate::memstats::record("index:extract");
+        let (files, artifact_files) = Self::partition_artifacts(files, &self.artifact_extensions());
         let (extractions, _skipped) =
             extract_files_isolated(&project_root, registry, files.clone());
 
@@ -333,6 +350,7 @@ impl TokenSave {
                 modified_at: *mtime,
                 indexed_at: current_timestamp(),
                 node_count: result.nodes.len() as u32,
+                kind: FileKind::Code,
             });
         }
 
@@ -354,6 +372,22 @@ impl TokenSave {
         all_edges.extend(doc_edges);
         if doc_count > 0 {
             on_verbose(&format!("discovered {doc_count} companion doc(s)"));
+        }
+
+        // Make containment available to resolution before `Contains` edges are
+        // denormalized into `nodes.parent_id` during the later DB insert.
+        let mut parent_ids: HashMap<&str, &str> = HashMap::new();
+        for edge in &all_edges {
+            if edge.kind == EdgeKind::Contains {
+                parent_ids
+                    .entry(edge.target.as_str())
+                    .or_insert(edge.source.as_str());
+            }
+        }
+        for node in &mut all_nodes {
+            if node.parent_id.is_none() {
+                node.parent_id = parent_ids.get(node.id.as_str()).map(|id| (*id).to_string());
+            }
         }
 
         // 5. Resolve references in-memory (parallel) before DB insert
@@ -393,6 +427,9 @@ impl TokenSave {
         all_edges.dedup_by(|a, b| {
             a.source == b.source && a.target == b.target && a.kind == b.kind && a.line == b.line
         });
+        // Artifacts contribute a `files` row and nothing else — no nodes, no
+        // edges, no body documents (#323).
+        file_records.extend(self.artifact_file_records(&artifact_files));
         file_records.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         let total_edges = all_edges.len();
 
@@ -439,12 +476,18 @@ impl TokenSave {
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
             .await?;
+        if self.registry.extractor_for_language("ruby").is_some() {
+            self.db
+                .set_metadata(RUBY_SINGLETON_KIND_METADATA, "1")
+                .await?;
+        }
 
         let result = IndexResult {
             file_count: files.len(),
             node_count: total_nodes,
             edge_count: total_edges,
             duration_ms,
+            skipped_extensions,
         };
         debug_assert!(
             result.node_count >= result.file_count || result.file_count == 0,
@@ -455,8 +498,33 @@ impl TokenSave {
             "non-empty index completed in zero milliseconds"
         );
         clear_dirty_sentinel(&self.project_root);
+        self.record_indexed_version();
         crate::memstats::record("index:done");
         Ok(result)
+    }
+
+    /// Records the running version as the one that produced the current index.
+    ///
+    /// Without this, a project indexed by the CLI keeps `last_indexed_version`
+    /// empty, which `bump_kind` classifies as a major bump — so the MCP server
+    /// forces a full reindex on the first tool call of every session (#320).
+    ///
+    /// Best-effort: failing to persist the marker must not fail an index that
+    /// otherwise succeeded.
+    fn record_indexed_version(&self) {
+        let running = env!("CARGO_PKG_VERSION");
+        match crate::config::load_config(&self.project_root) {
+            Ok(mut config) if config.last_indexed_version != running => {
+                config.last_indexed_version = running.to_string();
+                if let Err(e) = crate::config::save_config(&self.project_root, &config) {
+                    eprintln!("[tokensave] failed to record indexed version: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[tokensave] failed to load config to record indexed version: {e}");
+            }
+        }
     }
 
     /// Performs an incremental sync: detects changed, new, and removed files
@@ -640,6 +708,7 @@ impl TokenSave {
                 modified_at: *mtime,
                 indexed_at: current_timestamp(),
                 node_count: result.nodes.len() as u32,
+                kind: FileKind::Code,
             };
             self.db.upsert_file(&file_record).await?;
         }
@@ -762,6 +831,12 @@ impl TokenSave {
         let db_files = self.db.get_all_files().await?;
         let db_map: HashMap<String, FileRecord> =
             db_files.into_iter().map(|f| (f.path.clone(), f)).collect();
+        let repair_legacy_ruby_singletons = !db_map.is_empty()
+            && self
+                .db
+                .get_metadata(RUBY_SINGLETON_KIND_METADATA)
+                .await?
+                .is_none();
 
         // Partition files by comparing (mtime, size) against stored values
         let mut new_files: Vec<String> = Vec::new();
@@ -849,6 +924,28 @@ impl TokenSave {
                 }
             }
         }
+        let legacy_ruby_files: Vec<String> = if repair_legacy_ruby_singletons {
+            db_map
+                .keys()
+                .filter(|path| {
+                    current_set.contains(path.as_str())
+                        && self
+                            .registry
+                            .extractor_for_file(path)
+                            .is_some_and(|extractor| {
+                                extractor.language_name().eq_ignore_ascii_case("ruby")
+                            })
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for path in &legacy_ruby_files {
+            if !stale.contains(path) {
+                stale.push(path.clone());
+            }
+        }
         on_verbose(&format!(
             "content check: {} modified, {} mtime-only",
             stale.len(),
@@ -875,6 +972,13 @@ impl TokenSave {
 
         // Re-index stale and new files — extract in parallel, insert sequentially
         let to_index: Vec<String> = stale.iter().chain(new_files.iter()).cloned().collect();
+        // Artifacts take the same add/modify/remove path as source but skip
+        // extraction entirely; their row is the whole record (#323).
+        let (to_index, changed_artifacts) =
+            Self::partition_artifacts(to_index, &self.artifact_extensions());
+        for record in self.artifact_file_records(&changed_artifacts) {
+            self.db.upsert_file(&record).await?;
+        }
         let registry = &self.registry;
 
         let phase_start = Instant::now();
@@ -882,6 +986,15 @@ impl TokenSave {
         crate::memstats::record("sync:extract");
         let (sync_extractions, sync_skipped): (Vec<_>, Vec<_>) =
             extract_files_isolated(project_root, registry, to_index.clone());
+        let extracted_paths: HashSet<&str> = sync_extractions
+            .iter()
+            .map(|(path, _, _, _, _)| path.as_str())
+            .collect();
+        let ruby_repair_complete = legacy_ruby_repair_complete(
+            repair_legacy_ruby_singletons,
+            &legacy_ruby_files,
+            &extracted_paths,
+        );
         // Surface extractor timeouts/crashes in `SyncResult.skipped_paths`
         // so the user can see them in `tokensave sync --doctor`.
         skipped.extend(sync_skipped);
@@ -922,6 +1035,7 @@ impl TokenSave {
                 modified_at: *mtime,
                 indexed_at: current_timestamp(),
                 node_count: result.nodes.len() as u32,
+                kind: FileKind::Code,
             };
             self.db.upsert_file(&file_record).await?;
         }
@@ -990,6 +1104,11 @@ impl TokenSave {
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
             .await?;
+        if self.registry.extractor_for_language("ruby").is_some() && ruby_repair_complete {
+            self.db
+                .set_metadata(RUBY_SINGLETON_KIND_METADATA, "1")
+                .await?;
+        }
 
         clear_dirty_sentinel(&self.project_root);
         crate::memstats::record("sync:done");
@@ -1046,11 +1165,19 @@ impl TokenSave {
             self.project_root.is_dir(),
             "scan_files: project_root is not a directory"
         );
-        let supported_exts = self.registry.supported_extensions();
+        // Artifacts ride the same walk as source rather than getting a second
+        // one (#323). Everything that decides whether a path is in the project
+        // — exclude globs, gitignore, the symlink-cycle prune, the size limit —
+        // lives in that walk, and a parallel implementation would drift from it.
+        // Declared before the borrowed list so it outlives the `&str`s taken from it.
+        let artifact_exts = self.artifact_extensions();
+
+        let mut supported_exts = self.registry.supported_extensions();
         debug_assert!(
             !supported_exts.is_empty(),
             "scan_files: no supported extensions registered"
         );
+        supported_exts.extend(artifact_exts.iter().map(String::as_str));
 
         let mut skipped_map: HashMap<String, usize> = HashMap::new();
         let mut files = self.scan_project_files(&supported_exts, &mut skipped_map);
@@ -1318,6 +1445,66 @@ impl TokenSave {
         Some(rel_str)
     }
 
+    /// Returns the artifact extensions actually in effect for this project.
+    ///
+    /// An extension a language extractor already handles is dropped: the symbol
+    /// pass owns those files and records them with their symbols, so listing
+    /// one here would only race the two passes to write the same row.
+    pub(crate) fn artifact_extensions(&self) -> Vec<String> {
+        let supported = self.registry.supported_extensions();
+        self.config
+            .artifact_extensions
+            .iter()
+            .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|ext| !ext.is_empty() && !supported.contains(&ext.as_str()))
+            .collect()
+    }
+
+    /// Splits scanned paths into source files and artifacts.
+    ///
+    /// Artifacts are never handed to the extractor: they have no symbols by
+    /// definition, and routing them through extraction would mean teaching both
+    /// the in-process and subprocess paths to return an empty result.
+    pub(crate) fn partition_artifacts(
+        files: Vec<String>,
+        artifact_exts: &[String],
+    ) -> (Vec<String>, Vec<String>) {
+        files.into_iter().partition(|path| {
+            !std::path::Path::new(path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| artifact_exts.contains(&ext.to_ascii_lowercase()))
+        })
+    }
+
+    /// Builds the `files` row for an artifact, hashing it like any other file.
+    ///
+    /// The hash and stat are what incremental sync compares against, so an
+    /// artifact whose row omitted them would be re-processed on every sync.
+    fn artifact_file_record(&self, rel_path: &str) -> Option<FileRecord> {
+        let abs_path = self.project_root.join(rel_path);
+        let source = sync::read_source_file(&abs_path).ok()?;
+        let (modified_at, size) = sync::file_stat(&abs_path)
+            .unwrap_or_else(|| (current_timestamp(), source.len() as u64));
+        Some(FileRecord {
+            path: rel_path.to_string(),
+            content_hash: sync::content_hash(&source),
+            size,
+            modified_at,
+            indexed_at: current_timestamp(),
+            node_count: 0,
+            kind: FileKind::Artifact,
+        })
+    }
+
+    /// Builds `files` rows for every artifact path, in parallel.
+    fn artifact_file_records(&self, paths: &[String]) -> Vec<FileRecord> {
+        paths
+            .par_iter()
+            .filter_map(|path| self.artifact_file_record(path))
+            .collect()
+    }
+
     /// Gets the absolute path for a relative path.
     pub(crate) fn absolute_path(&self, relative_path: &str) -> PathBuf {
         self.project_root.join(relative_path)
@@ -1415,6 +1602,7 @@ impl TokenSave {
             modified_at: mtime,
             indexed_at: current_timestamp(),
             node_count: result.nodes.len() as u32,
+            kind: FileKind::Code,
         };
         self.db.upsert_file(&file_record).await?;
         self.db.rebuild_trait_dispatch_callers().await?;
@@ -1949,6 +2137,7 @@ fn build_executable_body_documents(
                 node.kind,
                 NodeKind::Function
                     | NodeKind::Method
+                    | NodeKind::SingletonMethod
                     | NodeKind::StructMethod
                     | NodeKind::Constructor
                     | NodeKind::AbstractMethod
@@ -1975,6 +2164,23 @@ pub(crate) fn can_use_literal_rewrite_fallback(pattern: &str) -> bool {
         && !pattern.contains('$')
         && !pattern.contains('\n')
         && !pattern.contains('\r')
+}
+
+#[cfg(test)]
+mod ruby_singleton_repair_tests {
+    use super::legacy_ruby_repair_complete;
+    use std::collections::HashSet;
+
+    #[test]
+    fn marker_requires_every_scheduled_legacy_ruby_file() {
+        let scheduled = vec!["publisher.rb".to_string(), "report.rb".to_string()];
+        let incomplete = HashSet::from(["publisher.rb"]);
+        assert!(!legacy_ruby_repair_complete(true, &scheduled, &incomplete));
+
+        let complete = HashSet::from(["publisher.rb", "report.rb"]);
+        assert!(legacy_ruby_repair_complete(true, &scheduled, &complete));
+        assert!(legacy_ruby_repair_complete(false, &scheduled, &incomplete));
+    }
 }
 
 /// Unit coverage for the #327 walk-scope predicate. Pure path relations run on

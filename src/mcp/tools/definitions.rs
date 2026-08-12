@@ -63,6 +63,55 @@ fn def_always_load(
     }
 }
 
+/// Add the explicit selectors and metadata used by tools that can query any
+/// initialized graph.
+fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
+    let Some(properties) = definition
+        .input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
+        panic!("tool input schema must have object properties");
+    };
+    properties.insert(
+        "graph_root".to_string(),
+        json!({
+            "type": "string",
+            "description": "Exact absolute initialized project root to query. Omit to query \
+             the project this server already serves; when present it must name a different \
+             project."
+        }),
+    );
+    properties.insert(
+        "graph_branch".to_string(),
+        json!({
+            "type": "string",
+            "description": "Exact tracked branch to query within graph_root. Requires \
+             graph_root."
+        }),
+    );
+
+    let Some(meta) = definition
+        .meta
+        .get_or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        panic!("tool metadata must be an object");
+    };
+    meta.insert("tokensave/graphScoped".to_string(), json!(true));
+    definition
+}
+
+/// Whether a tool definition explicitly supports selecting another graph.
+pub fn is_graph_scoped_tool(definition: &ToolDefinition) -> bool {
+    definition
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("tokensave/graphScoped"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// The `tokensave_context` description.
 ///
 /// The description must stay stable across re-indexes so MCP clients that
@@ -90,40 +139,41 @@ pub const CONTEXT_DESCRIPTION: &str = "Build an AI-ready context for a task desc
 /// which shells out to the `ast-grep` binary.
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let mut definitions = vec![
-        def_search(),
-        def_context(),
-        def_callers(),
-        def_callees(),
-        def_impact(),
-        def_node(),
+        graph_scoped(def_search()),
+        graph_scoped(def_context()),
+        graph_scoped(def_callers()),
+        graph_scoped(def_callees()),
+        graph_scoped(def_impact()),
+        graph_scoped(def_node()),
         def_status(),
-        def_files(),
+        graph_scoped(def_files()),
         def_affected(),
-        def_dead_code(),
+        graph_scoped(def_dead_code()),
         def_diff_context(),
-        def_module_api(),
-        def_circular(),
-        def_hotspots(),
-        def_similar(),
-        def_rename_preview(),
-        def_unused_imports(),
-        def_rank(),
-        def_largest(),
-        def_coupling(),
-        def_inheritance_depth(),
-        def_distribution(),
-        def_recursion(),
-        def_complexity(),
-        def_doc_coverage(),
-        def_god_class(),
+        graph_scoped(def_module_api()),
+        graph_scoped(def_circular()),
+        graph_scoped(def_imports()),
+        graph_scoped(def_hotspots()),
+        graph_scoped(def_similar()),
+        graph_scoped(def_rename_preview()),
+        graph_scoped(def_unused_imports()),
+        graph_scoped(def_rank()),
+        graph_scoped(def_largest()),
+        graph_scoped(def_coupling()),
+        graph_scoped(def_inheritance_depth()),
+        graph_scoped(def_distribution()),
+        graph_scoped(def_recursion()),
+        graph_scoped(def_complexity()),
+        graph_scoped(def_doc_coverage()),
+        graph_scoped(def_god_class()),
         def_changelog(),
         def_port_status(),
         def_port_order(),
         def_commit_context(),
         def_pr_context(),
         def_simplify_scan(),
-        def_test_map(),
-        def_type_hierarchy(),
+        graph_scoped(def_test_map()),
+        graph_scoped(def_type_hierarchy()),
         def_branch_search(),
         def_branch_diff(),
         def_branch_list(),
@@ -131,45 +181,45 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         def_multi_str_replace(),
         def_insert_at(),
         def_ast_grep_rewrite(),
-        def_gini(),
-        def_dependency_depth(),
-        def_health(),
+        graph_scoped(def_gini()),
+        graph_scoped(def_dependency_depth()),
+        graph_scoped(def_health()),
         def_redundancy(),
         def_runtime(),
-        def_dsm(),
-        def_test_risk(),
-        def_test_coverage(),
+        graph_scoped(def_dsm()),
+        graph_scoped(def_test_risk()),
+        graph_scoped(def_test_coverage()),
         def_dependencies(),
         def_session_start(),
         def_session_end(),
-        def_body(),
-        def_doc(),
-        def_todos(),
-        def_callers_for(),
-        def_by_qualified_name(),
-        def_signature(),
-        def_impls(),
+        graph_scoped(def_body()),
+        graph_scoped(def_doc()),
+        graph_scoped(def_todos()),
+        graph_scoped(def_callers_for()),
+        graph_scoped(def_by_qualified_name()),
+        graph_scoped(def_signature()),
+        graph_scoped(def_impls()),
         def_diagnose(),
-        def_derives(),
-        def_annotations(),
+        graph_scoped(def_derives()),
+        graph_scoped(def_annotations()),
         def_run_affected_tests(),
         def_record_decision(),
         def_record_code_area(),
         def_session_recall(),
-        def_read(),
-        def_entities(),
-        def_implementations(),
-        def_unsafe_patterns(),
+        graph_scoped(def_read()),
+        graph_scoped(def_entities()),
+        graph_scoped(def_implementations()),
+        graph_scoped(def_unsafe_patterns()),
         def_diagnostics(),
         def_config(),
-        def_signature_search(),
-        def_constructors(),
-        def_field_sites(),
-        def_call_chain(),
-        def_file_dependents(),
+        graph_scoped(def_signature_search()),
+        graph_scoped(def_constructors()),
+        graph_scoped(def_field_sites()),
+        graph_scoped(def_call_chain()),
+        graph_scoped(def_file_dependents()),
         def_replace_symbol(),
         def_insert_at_symbol(),
-        def_find_exact_symbol(),
+        graph_scoped(def_find_exact_symbol()),
         def_blame(),
         def_log(),
         def_diff(),
@@ -201,7 +251,8 @@ fn is_always_load(def: &ToolDefinition) -> bool {
 
 /// Returns only the tool definitions that are loaded into the model's context
 /// up front (`anthropic/alwaysLoad`: currently `tokensave_search`,
-/// `tokensave_context`, and `tokensave_status`).
+/// `tokensave_context`, `tokensave_status`, and the structural call-graph
+/// tools `tokensave_impact` and `tokensave_callees`, see #333).
 ///
 /// The remaining ~80 tools are deferred — their full schemas never enter the
 /// context unless the client fetches one on demand — so only this primary
@@ -452,6 +503,64 @@ fn def_signature() -> ToolDefinition {
     )
 }
 
+// `impact` and `callees` are eagerly loaded (#333): the call-graph tools are
+// where a pre-built index has its clearest advantage over grep-and-read, but
+// measured usage showed them at ~0 calls because they sat behind a ToolSearch
+// round-trip the model had to already suspect existed. Their schemas are small
+// and the prompt prefix is cached, so surfacing them up front is cheap.
+fn def_callees() -> ToolDefinition {
+    def_always_load(
+        "tokensave_callees",
+        "Callees",
+        "Find all callees of a given node (function, method, etc.) up to a \
+         specified depth. When a callee resolves to a trait method, the \
+         concrete impl methods reachable through that trait are also \
+         returned, tagged with `dispatch_via_trait: true` and a `dispatch_from` \
+         pointing at the trait method. Pass `resolve_dispatch: false` to \
+         disable this behaviour and get only direct call edges.",
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "The unique node ID to find callees for"
+                },
+                "max_depth": {
+                    "type": "number",
+                    "description": "Maximum traversal depth (default: 3)"
+                },
+                "resolve_dispatch": {
+                    "type": "boolean",
+                    "description": "If true (default), append concrete impl methods for any trait-method callee."
+                }
+            },
+            "required": ["node_id"]
+        }),
+    )
+}
+
+fn def_impact() -> ToolDefinition {
+    def_always_load(
+        "tokensave_impact",
+        "Impact Radius",
+        "Compute the impact radius of a node: all symbols that directly or indirectly depend on it.",
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "The unique node ID to compute impact for"
+                },
+                "max_depth": {
+                    "type": "number",
+                    "description": "Maximum traversal depth (default: 3)"
+                }
+            },
+            "required": ["node_id"]
+        }),
+    )
+}
+
 // ── Deferred tools (discovered via ToolSearch on demand) ────────────────
 
 fn def_callers() -> ToolDefinition {
@@ -487,59 +596,6 @@ fn def_callers() -> ToolDefinition {
     )
 }
 
-fn def_callees() -> ToolDefinition {
-    def(
-        "tokensave_callees",
-        "Callees",
-        "Find all callees of a given node (function, method, etc.) up to a \
-         specified depth. When a callee resolves to a trait method, the \
-         concrete impl methods reachable through that trait are also \
-         returned, tagged with `dispatch_via_trait: true` and a `dispatch_from` \
-         pointing at the trait method. Pass `resolve_dispatch: false` to \
-         disable this behaviour and get only direct call edges.",
-        json!({
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The unique node ID to find callees for"
-                },
-                "max_depth": {
-                    "type": "number",
-                    "description": "Maximum traversal depth (default: 3)"
-                },
-                "resolve_dispatch": {
-                    "type": "boolean",
-                    "description": "If true (default), append concrete impl methods for any trait-method callee."
-                }
-            },
-            "required": ["node_id"]
-        }),
-    )
-}
-
-fn def_impact() -> ToolDefinition {
-    def(
-        "tokensave_impact",
-        "Impact Radius",
-        "Compute the impact radius of a node: all symbols that directly or indirectly depend on it.",
-        json!({
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The unique node ID to compute impact for"
-                },
-                "max_depth": {
-                    "type": "number",
-                    "description": "Maximum traversal depth (default: 3)"
-                }
-            },
-            "required": ["node_id"]
-        }),
-    )
-}
-
 fn def_node() -> ToolDefinition {
     def(
         "tokensave_node",
@@ -562,7 +618,7 @@ fn def_files() -> ToolDefinition {
     def(
         "tokensave_files",
         "File List",
-        "List indexed project files. Use to explore file structure without reading file contents.",
+        "List indexed project files, including non-code artifacts such as .feature specs, schemas, and fixtures. Use to explore file structure, or to locate files by path pattern, without reading file contents.",
         json!({
             "type": "object",
             "properties": {
@@ -572,7 +628,12 @@ fn def_files() -> ToolDefinition {
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "Filter files matching this glob pattern (e.g. '**/*.rs')"
+                    "description": "Filter files matching this glob pattern (e.g. '**/*.rs', '**/*.feature')"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["code", "artifact"],
+                    "description": "Filter by file kind: 'code' for parsed source files, 'artifact' for non-code files tracked by path only (specs, schemas, fixtures, docs). Omit for both."
                 },
                 "format": {
                     "type": "string",
@@ -711,6 +772,35 @@ fn def_circular() -> ToolDefinition {
                 "max_depth": {
                     "type": "number",
                     "description": "Maximum cycle detection depth (default: 10)"
+                }
+            }
+        }),
+    )
+}
+
+fn def_imports() -> ToolDefinition {
+    def(
+        "tokensave_imports",
+        "Import Graph",
+        "Module-level import dependencies, cycles, and cut simulation. Unlike tokensave_circular (which works on files via symbol edges), this groups by module and reports the actual import statements holding each dependency together — so you can see how many edits removing it would take, and whether cutting it would break a cycle at all.",
+        json!({
+            "type": "object",
+            "properties": {
+                "depth": {
+                    "type": "number",
+                    "description": "Path components to group files into a module, 1-10 (default: 1). Depth 1 makes 'anomaly/alerts/slack.py' the module 'anomaly'; depth 2 makes it 'anomaly/alerts'."
+                },
+                "module": {
+                    "type": "string",
+                    "description": "Report the individual import statements for dependencies into or out of this module. Omit to get only the cycle summary."
+                },
+                "simulate_removal_from": {
+                    "type": "string",
+                    "description": "With simulate_removal_to: recompute cycles as if this dependency did not exist, to test whether a proposed cut actually breaks anything."
+                },
+                "simulate_removal_to": {
+                    "type": "string",
+                    "description": "Target module of the simulated cut. Requires simulate_removal_from."
                 }
             }
         }),
@@ -2525,6 +2615,154 @@ fn def_diff() -> ToolDefinition {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::unreadable_literal)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn canonical_graph_scoped_tools() -> BTreeSet<&'static str> {
+        [
+            "tokensave_search",
+            "tokensave_context",
+            "tokensave_callers",
+            "tokensave_callees",
+            "tokensave_impact",
+            "tokensave_node",
+            "tokensave_files",
+            "tokensave_dead_code",
+            "tokensave_module_api",
+            "tokensave_circular",
+            "tokensave_hotspots",
+            "tokensave_similar",
+            "tokensave_rename_preview",
+            "tokensave_unused_imports",
+            "tokensave_rank",
+            "tokensave_largest",
+            "tokensave_coupling",
+            "tokensave_inheritance_depth",
+            "tokensave_distribution",
+            "tokensave_recursion",
+            "tokensave_complexity",
+            "tokensave_doc_coverage",
+            "tokensave_god_class",
+            "tokensave_test_map",
+            "tokensave_type_hierarchy",
+            "tokensave_gini",
+            "tokensave_dependency_depth",
+            "tokensave_health",
+            "tokensave_dsm",
+            "tokensave_test_risk",
+            "tokensave_test_coverage",
+            "tokensave_body",
+            "tokensave_doc",
+            "tokensave_todos",
+            "tokensave_callers_for",
+            "tokensave_by_qualified_name",
+            "tokensave_signature",
+            "tokensave_impls",
+            "tokensave_derives",
+            "tokensave_annotations",
+            "tokensave_read",
+            "tokensave_entities",
+            "tokensave_implementations",
+            "tokensave_unsafe_patterns",
+            "tokensave_signature_search",
+            "tokensave_constructors",
+            "tokensave_field_sites",
+            "tokensave_call_chain",
+            "tokensave_file_dependents",
+            "tokensave_find_exact_symbol",
+            "tokensave_imports",
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn graph_scoped_defs_match_the_canonical_set() {
+        let canonical = canonical_graph_scoped_tools();
+        let definitions = get_tool_definitions();
+
+        for definition in &definitions {
+            let expected = canonical.contains(definition.name.as_str());
+            let properties = definition.input_schema["properties"].as_object().unwrap();
+            let graph_root = properties.get("graph_root");
+            let graph_branch = properties.get("graph_branch");
+
+            assert_eq!(
+                graph_root.is_some(),
+                expected,
+                "{} graph_root scope mismatch",
+                definition.name
+            );
+            assert_eq!(
+                graph_branch.is_some(),
+                expected,
+                "{} graph_branch scope mismatch",
+                definition.name
+            );
+            assert_eq!(
+                is_graph_scoped_tool(definition),
+                expected,
+                "{} graph-scoped marker mismatch",
+                definition.name
+            );
+
+            if expected {
+                assert_eq!(graph_root.unwrap()["type"], "string", "{}", definition.name);
+                assert_eq!(
+                    graph_root.unwrap()["description"],
+                    "Exact absolute initialized project root to query. Omit to query the \
+                     project this server already serves; when present it must name a different \
+                     project.",
+                    "{}",
+                    definition.name
+                );
+                assert_eq!(
+                    graph_branch.unwrap()["type"],
+                    "string",
+                    "{}",
+                    definition.name
+                );
+                assert_eq!(
+                    graph_branch.unwrap()["description"],
+                    "Exact tracked branch to query within graph_root. Requires graph_root.",
+                    "{}",
+                    definition.name
+                );
+                let required = definition.input_schema["required"].as_array();
+                assert!(
+                    required.is_none_or(|names| {
+                        names
+                            .iter()
+                            .all(|name| name != "graph_root" && name != "graph_branch")
+                    }),
+                    "{} graph selectors must be optional",
+                    definition.name
+                );
+            }
+        }
+
+        let actual: BTreeSet<&str> = definitions
+            .iter()
+            .filter(|definition| is_graph_scoped_tool(definition))
+            .map(|definition| definition.name.as_str())
+            .collect();
+        assert_eq!(actual.len(), 51);
+        assert_eq!(actual, canonical);
+    }
+
+    #[test]
+    fn graph_scoped_schema_and_classification_cannot_drift() {
+        for definition in get_tool_definitions() {
+            let properties = definition.input_schema["properties"].as_object().unwrap();
+            let has_scope_schema =
+                properties.contains_key("graph_root") && properties.contains_key("graph_branch");
+            assert_eq!(
+                is_graph_scoped_tool(&definition),
+                has_scope_schema,
+                "{}",
+                definition.name
+            );
+        }
+    }
 
     #[test]
     fn context_description_carries_no_call_budget() {
@@ -2544,10 +2782,17 @@ mod tests {
     fn always_load_defs_are_the_primary_subset() {
         let primary = get_always_load_tool_definitions();
         let names: Vec<&str> = primary.iter().map(|d| d.name.as_str()).collect();
-        // Exactly the three tools built via `def_always_load`.
+        // Exactly the tools built via `def_always_load`, in `get_tool_definitions`
+        // push order. `callees` and `impact` joined the set in #333.
         assert_eq!(
             names,
-            ["tokensave_search", "tokensave_context", "tokensave_status"]
+            [
+                "tokensave_search",
+                "tokensave_context",
+                "tokensave_callees",
+                "tokensave_impact",
+                "tokensave_status"
+            ]
         );
         // Every returned def actually carries the alwaysLoad marker...
         assert!(primary.iter().all(is_always_load));

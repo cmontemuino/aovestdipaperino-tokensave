@@ -31,7 +31,8 @@ const CODE_EXTENSIONS: &[&str] = &[
     "dart", "pas", "pp", "dpr", "php", "phtml", "rb", "rake", "gemspec", "sh", "bash", "zsh",
     "proto", "ps1", "psm1", "psd1", "nix", "vb", "vbs", // Full tier
     "lua", "zig", "m", "mm", "pl", "pm", "bat", "cmd", "f", "f90", "f95", "f03", "for", "ftn",
-    "cbl", "cob", "cpy", "bas",
+    "cbl", "cob", "cpy", "bas", // HDL
+    "v", "vh", "sv", "svh",
 ];
 
 /// Directory basenames that we treat as "code roots" when a grep target has no
@@ -92,34 +93,56 @@ const CODE_TYPE_FILTERS: &[&str] = &[
 /// directly.
 #[derive(Debug, Clone, Default)]
 pub struct HookEnv {
-    /// `true` when the current working directory contains a usable tokensave
-    /// index (`.tokensave/tokensave.db`). Without an index there is nothing
-    /// to redirect to, so the hook always passes through.
-    pub cwd_has_tokensave_db: bool,
+    /// `true` when the working directory is inside a usable tokensave index
+    /// (`.tokensave/tokensave.db` in it or in an ancestor). Without an index
+    /// there is nothing to redirect to, so the hook always passes through.
+    pub in_tokensave_project: bool,
 
     /// `true` when the user has opted out for this invocation via
     /// `TOKENSAVE_DISABLE_GREP_HOOK=1`.
     pub disable_grep_hook: bool,
 
-    /// The indexed project root, i.e. the working directory itself whenever
-    /// `cwd_has_tokensave_db` is `true`. Kept so a target spelled as an
-    /// absolute (or `~`-rooted) path can be recognized as the whole project
-    /// instead of an unknown directory. `None` and `cwd_has_tokensave_db`
-    /// always agree; `from_runtime()` derives both from one probe.
+    /// The indexed project root the working directory belongs to. Kept so a
+    /// target spelled as an absolute (or `~`-rooted) path can be recognized as
+    /// the whole project instead of an unknown directory. `None` and
+    /// `in_tokensave_project` always agree; both come from one discovery walk.
     pub project_root: Option<PathBuf>,
 }
 
 impl HookEnv {
     /// Snapshot the real environment.
     pub fn from_runtime() -> Self {
-        let project_root = std::env::current_dir()
-            .ok()
-            .filter(|c| c.join(".tokensave").join("tokensave.db").exists());
+        Self::from_runtime_at(std::env::current_dir().ok().as_deref())
+    }
+
+    /// [`HookEnv::from_runtime`] with an explicit working directory, so a
+    /// harness that reports its own `cwd` can be honored and tests can stay
+    /// hermetic. Discovers the project the same way `serve`, `sync`, and
+    /// `status` do, by walking ancestors.
+    pub fn from_runtime_at(cwd: Option<&Path>) -> Self {
+        let project_root = cwd.and_then(crate::config::discover_project_root);
         let disable_grep_hook = std::env::var("TOKENSAVE_DISABLE_GREP_HOOK")
             .is_ok_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
         Self {
-            cwd_has_tokensave_db: project_root.is_some(),
+            in_tokensave_project: project_root.is_some(),
             disable_grep_hook,
+            project_root,
+        }
+    }
+
+    /// Re-resolve the project from a hook event's top-level `cwd`, the working
+    /// directory of the session that issued the tool call. The hook process
+    /// itself can be spawned anywhere. The opt-out belongs to that process, so
+    /// it survives the override, and an event without a usable `cwd` leaves the
+    /// environment untouched.
+    fn for_event(&self, event: &Value) -> Self {
+        let Some(cwd) = event_cwd(event) else {
+            return self.clone();
+        };
+        let project_root = crate::config::discover_project_root(&cwd);
+        Self {
+            in_tokensave_project: project_root.is_some(),
+            disable_grep_hook: self.disable_grep_hook,
             project_root,
         }
     }
@@ -174,12 +197,18 @@ pub fn evaluate_claude_pre_tool_use(raw: &str) -> String {
 }
 
 /// [`evaluate_claude_pre_tool_use`] with an explicit environment snapshot.
+///
+/// The snapshot is a base: when the event reports its own `cwd`, the project is
+/// re-discovered from there.
 pub fn evaluate_claude_pre_tool_use_with_env(raw: &str, env: &HookEnv) -> String {
-    let tool_input = serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
+    let event = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let env = event
+        .as_ref()
+        .map_or_else(|| env.clone(), |event| env.for_event(event));
+    let tool_input = event
         .and_then(|v| v.get("tool_input").cloned())
         .map_or_else(|| raw.to_string(), |ti| ti.to_string());
-    evaluate_hook_decision_with_env(&tool_input, env)
+    evaluate_hook_decision_with_env(&tool_input, &env)
 }
 
 /// Pure decision logic for the `PreToolUse` hook, using the real process
@@ -215,7 +244,7 @@ fn evaluate_hook_decision_core(tool_input: &str, env: &HookEnv) -> Option<String
     // without a `.tokensave` index there are no MCP tools to redirect to, and
     // the opt-out gives a user who deliberately wants to delegate an explicit
     // override instead of a hard wall.
-    if env.cwd_has_tokensave_db && !env.disable_grep_hook {
+    if env.in_tokensave_project && !env.disable_grep_hook {
         // A blank `subagent_type` is treated as absent: a caller that
         // initializes the field to "" is no more a deliberate typed delegation
         // than one that omits it, so it must not slip past both the Explore
@@ -252,11 +281,19 @@ fn evaluate_hook_decision_core(tool_input: &str, env: &HookEnv) -> Option<String
         if let Some(reason) = evaluate_grep_tool_input(&parsed, env) {
             return Some(reason);
         }
+        // Glob shares the `pattern` field with Grep and is told apart by the
+        // fields it lacks (#294).
+        if let Some(reason) = evaluate_glob_tool_input(&parsed, env) {
+            return Some(reason);
+        }
     }
 
     // Bash/Execute tool — `command` is the discriminating field.
     if let Some(command) = parsed.get("command").and_then(|v| v.as_str()) {
         if let Some(reason) = evaluate_bash_command(command, env) {
+            return Some(reason);
+        }
+        if let Some(reason) = evaluate_find_command(command, env) {
             return Some(reason);
         }
     }
@@ -293,7 +330,7 @@ fn build_block_message(reason: &str) -> String {
 
 /// Inspect a `Grep` tool input. Returns `Some(reason)` to redirect.
 fn evaluate_grep_tool_input(parsed: &Value, env: &HookEnv) -> Option<String> {
-    if !env.cwd_has_tokensave_db || env.disable_grep_hook {
+    if !env.in_tokensave_project || env.disable_grep_hook {
         return None;
     }
     let pattern = parsed.get("pattern").and_then(|v| v.as_str())?;
@@ -323,7 +360,7 @@ fn evaluate_grep_tool_input(parsed: &Value, env: &HookEnv) -> Option<String> {
 
 /// Inspect a `Bash` tool command. Returns `Some(reason)` to redirect.
 fn evaluate_bash_command(command: &str, env: &HookEnv) -> Option<String> {
-    if !env.cwd_has_tokensave_db || env.disable_grep_hook {
+    if !env.in_tokensave_project || env.disable_grep_hook {
         return None;
     }
     // An explicit inline `TOKENSAVE_DISABLE_GREP_HOOK=<truthy>` opts out too, so
@@ -341,6 +378,90 @@ fn evaluate_bash_command(command: &str, env: &HookEnv) -> Option<String> {
     }
     let shape = classify_symbol_pattern(&inv.pattern)?;
     Some(redirect_message("Bash grep", &inv.pattern, shape))
+}
+
+/// Inspect a `Bash` `find`/`fd` command. Returns `Some(reason)` to redirect.
+///
+/// Path-shaped discovery has a graph answer now that non-code artifacts are
+/// tracked too (#323); before that, `tokensave_files` was lossy and redirecting
+/// here would have traded a working command for an empty result (#294).
+fn evaluate_find_command(command: &str, env: &HookEnv) -> Option<String> {
+    if !env.in_tokensave_project || env.disable_grep_hook {
+        return None;
+    }
+    if strip_command_prefixes(command.trim()).disables_hook {
+        return None;
+    }
+    let inv = extract_find_invocation(command)?;
+
+    // Every root must be code-ish. A search spanning an unindexed tree is one
+    // `tokensave_files` cannot answer, and a partial answer is worse than none.
+    if !inv.targets.is_empty()
+        && !inv
+            .targets
+            .iter()
+            .all(|target| target_looks_like_code(target, "", "", env))
+    {
+        return None;
+    }
+
+    // Likewise every name glob: `find . -name '*.rs' -o -name '*.bin'` is only
+    // redirectable if the whole thing is.
+    if !inv
+        .globs
+        .iter()
+        .all(|glob| classify_glob_target(glob) == Some(true))
+    {
+        return None;
+    }
+
+    Some(files_redirect_message("Bash find", &inv.globs.join(", ")))
+}
+
+/// Inspect a `Glob` tool call. Returns `Some(reason)` to redirect.
+fn evaluate_glob_tool_input(parsed: &Value, env: &HookEnv) -> Option<String> {
+    if !env.in_tokensave_project || env.disable_grep_hook {
+        return None;
+    }
+    // `Grep` and `Glob` both carry `pattern`; only `Grep` carries these. Without
+    // the check a content search would be misread as a path search, which is
+    // the one mistake that would send a caller to a tool that cannot help.
+    if parsed.get("output_mode").is_some()
+        || parsed.get("glob").is_some()
+        || parsed.get("glob_pattern").is_some()
+        || parsed.get("type").is_some()
+    {
+        return None;
+    }
+    let pattern = parsed.get("pattern").and_then(|v| v.as_str())?;
+    if pattern.is_empty() || pattern.len() > MAX_PATTERN_LEN {
+        return None;
+    }
+    // A glob without a wildcard is indistinguishable from a `Grep` pattern that
+    // happens to contain a dot, so require the wildcard before claiming this is
+    // a path search at all.
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return None;
+    }
+    if classify_glob_target(pattern) != Some(true) {
+        return None;
+    }
+    let path = parsed.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if !target_looks_like_code(path, "", "", env) {
+        return None;
+    }
+    Some(files_redirect_message("Glob", pattern))
+}
+
+/// Redirect text for path-shaped discovery, which `tokensave_files` answers.
+fn files_redirect_message(tool_label: &str, pattern: &str) -> String {
+    format!(
+        "STOP: This {tool_label} searches a tokensave-indexed project for files matching \
+         `{pattern}`. Use tokensave_files(pattern=\"{pattern}\") instead — it answers from the \
+         index, honors the project's ignore rules, and covers non-code artifacts (specs, \
+         schemas, fixtures) as well as source. To override for this one call, set \
+         TOKENSAVE_DISABLE_GREP_HOOK=1 in the shell."
+    )
 }
 
 fn redirect_message(tool_label: &str, pattern: &str, shape: PatternShape) -> String {
@@ -541,6 +662,88 @@ fn classify_glob_target(glob: &str) -> Option<bool> {
 struct GrepInvocation {
     pattern: String,
     targets: Vec<String>,
+}
+
+/// A `find`/`fd` invocation reduced to what the policy needs: the name globs
+/// it is searching for and the directories it is searching under.
+#[derive(Debug, Default)]
+struct FindInvocation {
+    /// Name patterns, normalized to glob form (`*.rs`), in command order.
+    globs: Vec<String>,
+    /// Search roots, in command order. Empty means the default (`.`).
+    targets: Vec<String>,
+}
+
+/// Parse a bash command that *starts* with `find` or `fd`, after the same
+/// leading-noise stripping `extract_grep_invocation` applies.
+///
+/// Only the name-matching forms are recognized, because only those have a
+/// `tokensave_files` equivalent: `-name`/`-iname` for `find`, and
+/// `-e`/`--extension`/`-g`/`--glob` for `fd`. A `find` predicate this does not
+/// understand (`-mtime`, `-size`, `-exec`, …) is not a discovery-by-name call
+/// and is deliberately left alone, as is `fd`'s default regex form — a regex is
+/// not a glob, and guessing at one would block calls we cannot actually serve.
+fn extract_find_invocation(command: &str) -> Option<FindInvocation> {
+    let rest = strip_command_prefixes(command.trim()).rest;
+    let (is_find, after_tool) = if let Some(after) = rest.strip_prefix("find ") {
+        (true, after)
+    } else if let Some(after) = rest.strip_prefix("fd ") {
+        (false, after)
+    } else {
+        return None;
+    };
+
+    let mut inv = FindInvocation::default();
+    let mut iter = shell_split(after_tool).into_iter().peekable();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            // `find`: -name/-iname take the glob as the next token.
+            "-name" | "-iname" if is_find => {
+                let Some(glob) = iter.next() else { continue };
+                inv.globs.push(glob);
+            }
+            // `fd`: an extension is given bare, so restore the glob form the
+            // rest of the policy already knows how to classify.
+            "-e" | "--extension" if !is_find => {
+                let Some(ext) = iter.next() else { continue };
+                inv.globs.push(format!("*.{ext}"));
+            }
+            "-g" | "--glob" if !is_find => {
+                let Some(glob) = iter.next() else { continue };
+                inv.globs.push(glob);
+            }
+            // Flags that only narrow the result set, and so cannot change what
+            // the command is asking for. `find . -type f -name '*.py'` is the
+            // ordinary spelling; without these the common case would bail out
+            // as unmodelled and the redirect would almost never fire.
+            "-type" | "-maxdepth" | "-mindepth" if is_find => {
+                iter.next();
+            }
+            "-print" | "-print0" | "-follow" if is_find => {}
+            "-t" | "--type" | "-d" | "--max-depth" | "-E" | "--exclude" if !is_find => {
+                iter.next();
+            }
+            // A predicate we do not model can change what the command means —
+            // `-delete` and `-exec` most of all — so stop claiming to
+            // understand the invocation rather than redirect it.
+            _ if is_find && tok.starts_with('-') => return None,
+            // `fd`'s remaining flags (`--hidden`, `-t f`, …) narrow the result
+            // set without changing what is being matched, so they are ignored.
+            _ if tok.starts_with('-') => {}
+            // `find` takes its roots before the predicates; `fd` takes the
+            // pattern first and the path after. Either way a bare token that
+            // is not a name glob is a search root.
+            _ => inv.targets.push(tok),
+        }
+    }
+
+    // `fd PATTERN [PATH]` with no flags: the first bare token is a regex, not
+    // a path. Treating it as a search root would misread the command.
+    if !is_find && !inv.targets.is_empty() && inv.globs.is_empty() {
+        return None;
+    }
+
+    (!inv.globs.is_empty()).then_some(inv)
 }
 
 /// Parse a bash command that *starts* with `grep`, `rg`, or `ag` after leading
@@ -860,15 +1063,20 @@ pub fn evaluate_kiro_pre_tool_use(event_json: &str) -> Option<&'static str> {
 /// [`evaluate_kiro_pre_tool_use`] with an explicit environment snapshot.
 ///
 /// Gated like the Claude agent path: no `.tokensave` index means there is
-/// nothing to redirect to, and the opt-out env var suppresses the block.
+/// nothing to redirect to, and the opt-out env var suppresses the block. The
+/// index is resolved from the event's `cwd` when it reports one, matching the
+/// `postToolUse` sync hook.
 pub fn evaluate_kiro_pre_tool_use_with_env(
     event_json: &str,
     env: &HookEnv,
 ) -> Option<&'static str> {
-    if !env.cwd_has_tokensave_db || env.disable_grep_hook {
+    if env.disable_grep_hook {
         return None;
     }
     let parsed: Value = serde_json::from_str(event_json).ok()?;
+    if !env.for_event(&parsed).in_tokensave_project {
+        return None;
+    }
     let tool_name = parsed.get("tool_name").and_then(Value::as_str)?;
     if !is_kiro_delegation_tool(tool_name) {
         return None;
@@ -928,6 +1136,7 @@ pub fn evaluate_droid_pre_tool_use_with_env(raw: &str, env: &HookEnv) -> Option<
         return evaluate_hook_decision_core(raw, env);
     };
     let is_task = event.get("tool_name").and_then(Value::as_str) == Some("Task");
+    let env = env.for_event(&event);
     let mut tool_input = event.get("tool_input").cloned().unwrap_or(event);
     let subagent_type = tool_input.get("subagent_type").and_then(Value::as_str);
 
@@ -938,7 +1147,7 @@ pub fn evaluate_droid_pre_tool_use_with_env(raw: &str, env: &HookEnv) -> Option<
         tool_input["subagent_type"] = Value::String("Explore".to_string());
     }
 
-    evaluate_hook_decision_core(&tool_input.to_string(), env)
+    evaluate_hook_decision_core(&tool_input.to_string(), &env)
 }
 
 fn kiro_event_has_research_text(value: &Value) -> bool {
@@ -1057,14 +1266,19 @@ fn kiro_project_root(event_json: &str) -> Option<PathBuf> {
 }
 
 fn kiro_event_cwd(event_json: &str) -> Option<PathBuf> {
-    let parsed: Value = serde_json::from_str(event_json).ok()?;
-    let cwd = parsed.get("cwd").and_then(Value::as_str)?;
-    let path = Path::new(cwd);
-    if path.as_os_str().is_empty() {
-        None
-    } else {
-        Some(path.to_path_buf())
-    }
+    event_cwd(&serde_json::from_str::<Value>(event_json).ok()?)
+}
+
+/// The session working directory a harness reports at the top level of its
+/// hook event. Kiro, Claude Code, and Factory Droid all use the `cwd` key.
+///
+/// The value is agent-supplied, so only an absolute path to an existing
+/// directory is accepted; anything else yields `None` and leaves the caller on
+/// the hook process's own directory. A relative or stale `cwd` would otherwise
+/// start the ancestor walk somewhere neither the agent nor the user meant.
+fn event_cwd(event: &Value) -> Option<PathBuf> {
+    let path = Path::new(event.get("cwd").and_then(Value::as_str)?.trim());
+    (path.is_absolute() && path.is_dir()).then(|| path.to_path_buf())
 }
 
 fn read_stdin_to_string() -> String {
@@ -1083,7 +1297,7 @@ pub async fn hook_stop() {
         return;
     };
 
-    let stats = crate::accounting::parser::ingest(&gdb).await;
+    let stats = crate::accounting::parser::ingest_claude_only(&gdb).await;
     if stats.turns_inserted == 0 {
         return;
     }

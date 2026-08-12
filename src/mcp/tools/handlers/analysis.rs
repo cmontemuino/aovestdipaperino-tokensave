@@ -350,7 +350,13 @@ pub(super) async fn handle_dead_code(
     scope_prefix: Option<&str>,
 ) -> Result<ToolResult> {
     let kinds: Vec<NodeKind> = args.get("kinds").and_then(|v| v.as_array()).map_or_else(
-        || vec![NodeKind::Function, NodeKind::Method],
+        || {
+            vec![
+                NodeKind::Function,
+                NodeKind::Method,
+                NodeKind::SingletonMethod,
+            ]
+        },
         |arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().and_then(NodeKind::from_str))
@@ -487,6 +493,74 @@ pub(super) async fn handle_circular(cg: &TokenSave, _args: Value) -> Result<Tool
         "cycle_count": cycles.len(),
         "cycles": items,
     });
+
+    let formatted = serde_json::to_string_pretty(&output).unwrap_or_default();
+    Ok(ToolResult {
+        value: json!({
+            "content": [{ "type": "text", "text": truncate_response(&formatted) }]
+        }),
+        touched_files: vec![],
+    })
+}
+
+/// Handles `tokensave_imports` tool calls.
+///
+/// Answers the module-level dependency questions that `tokensave_circular`
+/// cannot: which packages are mutually reachable, how many import statements
+/// hold a given pair together, and whether cutting one dependency would
+/// actually break a cycle (#334).
+pub(super) async fn handle_imports(cg: &TokenSave, args: Value) -> Result<ToolResult> {
+    let depth = args
+        .get("depth")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(1, |v| v.clamp(1, 10) as usize);
+
+    let graph = cg.build_module_import_graph(depth).await?;
+    let cycles = graph.cycles();
+
+    let mut output = json!({
+        "depth": depth,
+        "cycle_count": cycles.len(),
+        "cycles": cycles,
+    });
+
+    // A dependency listing over a whole repo is large and mostly uninteresting;
+    // the caller nearly always wants either one module's edges or one specific
+    // pair, so an unfiltered dump is not the default.
+    let module = args.get("module").and_then(|v| v.as_str());
+    let dependencies: Vec<_> = graph
+        .dependencies()
+        .into_iter()
+        .filter(|dep| module.is_none_or(|m| dep.from == m || dep.to == m))
+        .collect();
+    if module.is_some() {
+        output["dependencies"] = serde_json::to_value(&dependencies).unwrap_or(json!([]));
+    }
+
+    // Cut simulation: report what survives, not just what was removed. A cut
+    // that leaves every module still mutually reachable buys nothing, and only
+    // recomputing the components tells the two apart.
+    if let (Some(from), Some(to)) = (
+        args.get("simulate_removal_from").and_then(|v| v.as_str()),
+        args.get("simulate_removal_to").and_then(|v| v.as_str()),
+    ) {
+        let remaining = graph.cycles_without(from, to);
+        let sites = graph
+            .dependencies()
+            .into_iter()
+            .find(|dep| dep.from == from && dep.to == to)
+            .map(|dep| dep.sites)
+            .unwrap_or_default();
+        output["simulated_cut"] = json!({
+            "from": from,
+            "to": to,
+            "import_sites_to_change": sites.len(),
+            "sites": sites,
+            "cycle_count_after": remaining.len(),
+            "cycles_after": remaining,
+            "breaks_a_cycle": remaining.len() < cycles.len(),
+        });
+    }
 
     let formatted = serde_json::to_string_pretty(&output).unwrap_or_default();
     Ok(ToolResult {
@@ -1748,7 +1822,9 @@ pub(super) async fn handle_unsafe_patterns(
         .map_or(200, |v| v.min(2000) as usize);
 
     let project_root = cg.project_root();
-    let files = cg.get_all_files().await?;
+    // Source-text scan: tracked artifacts have no code constructs to find, so
+    // reading them is pure cost (#323).
+    let files = cg.get_code_files().await?;
     let mut matches: Vec<Value> = Vec::new();
     let mut by_kind: HashMap<String, u64> = HashMap::new();
     let mut touched: Vec<String> = Vec::new();
@@ -1983,7 +2059,9 @@ pub(super) async fn handle_constructors(
     }
 
     let project_root = cg.project_root();
-    let files = cg.get_all_files().await?;
+    // Source-text scan: tracked artifacts have no code constructs to find, so
+    // reading them is pure cost (#323).
+    let files = cg.get_code_files().await?;
     let mut sites: Vec<Value> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
 
@@ -2341,7 +2419,9 @@ pub(super) async fn handle_field_sites(
     };
 
     let project_root = cg.project_root();
-    let files = cg.get_all_files().await?;
+    // Source-text scan: tracked artifacts have no code constructs to find, so
+    // reading them is pure cost (#323).
+    let files = cg.get_code_files().await?;
     let mut writes: Vec<Value> = Vec::new();
     let mut reads: Vec<Value> = Vec::new();
     let mut touched: Vec<String> = Vec::new();

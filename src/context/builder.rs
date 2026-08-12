@@ -9,6 +9,7 @@ use crate::context::ranking::{
 use crate::db::Database;
 use crate::errors::Result;
 use crate::graph::GraphTraverser;
+use crate::text::{is_camel_case, split_compound};
 use crate::types::*;
 
 /// Builds AI-ready context by combining search, graph traversal, and source code extraction.
@@ -170,8 +171,9 @@ impl<'a> ContextBuilder<'a> {
     /// Searches for entry-point nodes matching the query and extracted symbols.
     ///
     /// Pipeline:
-    /// 1. FTS search on the full query, each extracted symbol, stem variants,
-    ///    and agent-provided extra keywords.
+    /// 1. FTS search on the full query, each extracted symbol, and
+    ///    agent-provided extra keywords (the porter tokenizer handles
+    ///    inflected variants at match time).
     /// 2. Exact name supplement — ensures perfect name matches are never buried
     ///    by BM25 noise.
     /// 3. Exact source supplement — qualified expressions such as
@@ -206,7 +208,12 @@ impl<'a> ContextBuilder<'a> {
         // name) is merged in place via MAX score rather than first-seen-wins.
         let mut index_of: HashMap<String, usize> = HashMap::new();
         let mut candidates: Vec<SearchResult> = Vec::new();
-        let literal_terms = exact_source_terms(query, &options.extra_keywords);
+        // Qualified paths (`foo::bar`) and verbatim multi-word phrases are both
+        // exact-copy evidence and share one source scan. The phrases matter for
+        // string literals, which live in no symbol name and which FTS ranks
+        // badly when they sit inside a large object literal (#362).
+        let mut literal_terms = exact_source_terms(query, &options.extra_keywords);
+        literal_terms.extend(exact_phrase_terms(query, &options.extra_keywords));
         let exact_source_candidates = self
             .find_exact_source_candidates(&literal_terms, options)
             .await?;
@@ -234,22 +241,12 @@ impl<'a> ContextBuilder<'a> {
         };
         let body_terms = conceptual_query_terms(query, &options.extra_keywords);
         for term in &body_terms {
+            // The symbol FTS index uses `porter unicode61`, so inflected prose
+            // ("generates", "ranking") stems to match indexed identifiers —
+            // the old query-side plural-strip hack (#264) is no longer needed.
             push_term(term.clone(), &mut fts_terms, &mut fts_seen);
-            // The symbol FTS tokenizer (unicode61) does not stem, so a prose
-            // verb like "generates" never prefix-matches an indexed name such
-            // as `generateLauncherIcon`. Fold a trailing plural/third-person
-            // `s` into a second search term (#264).
-            if let Some(stem) = term.strip_suffix('s') {
-                if stem.len() >= 4 && !stem.ends_with('s') {
-                    push_term(stem.to_string(), &mut fts_terms, &mut fts_seen);
-                }
-            }
         }
         for s in symbols {
-            push_term(s.clone(), &mut fts_terms, &mut fts_seen);
-        }
-        let stems = generate_stem_variants(symbols);
-        for s in &stems {
             push_term(s.clone(), &mut fts_terms, &mut fts_seen);
         }
         for k in &options.extra_keywords {
@@ -520,7 +517,9 @@ impl<'a> ContextBuilder<'a> {
             return Ok(Vec::new());
         }
 
-        let mut files = self.db.get_all_files().await?;
+        // Candidates are keyed by the nodes a file contains, so an artifact
+        // could never contribute one — scanning them would only cost I/O (#323).
+        let mut files = self.db.get_code_files().await?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut candidates: HashMap<String, SearchResult> = HashMap::new();
 
@@ -997,6 +996,7 @@ const SYMBOL_STOP_WORDS: &[&str] = &[
     "call",
     "function",
     "method",
+    "singleton_method",
     "class",
     "struct",
     "type",
@@ -1108,122 +1108,61 @@ fn is_authored_symbol(symbol: &str, query: &str, extra_keywords: &[String]) -> b
         || extra_keywords.iter().any(|k| k == symbol)
 }
 
-/// Split a compound name into individual words.
-///
-/// Handles camelCase, `PascalCase`, and `snake_case`:
-/// - `getUserName` → `["get", "User", "Name"]`
-/// - `process_request` → `["process", "request"]`
-/// - `MAX_RETRIES` → `["MAX", "RETRIES"]`
-fn split_compound(name: &str) -> Vec<&str> {
-    if name.contains('_') {
-        return name.split('_').filter(|s| !s.is_empty()).collect();
-    }
-
-    // camelCase / PascalCase splitting
-    let bytes = name.as_bytes();
-    let mut parts = Vec::new();
-    let mut start = 0;
-
-    for i in 1..bytes.len() {
-        let cur = bytes[i] as char;
-        let prev = bytes[i - 1] as char;
-
-        // Split at lowercase→uppercase boundary (e.g. getUser → get|User)
-        let boundary = prev.is_ascii_lowercase() && cur.is_ascii_uppercase();
-        // Split at uppercase→uppercase+lowercase (e.g. XMLParser → XML|Parser)
-        let acronym_end = i + 1 < bytes.len()
-            && prev.is_ascii_uppercase()
-            && cur.is_ascii_uppercase()
-            && (bytes[i + 1] as char).is_ascii_lowercase();
-
-        if boundary || acronym_end {
-            if i > start {
-                parts.push(&name[start..i]);
-            }
-            start = i;
-        }
-    }
-    if start < name.len() {
-        parts.push(&name[start..]);
-    }
-    parts
-}
-
-/// Returns `true` if `word` looks like CamelCase.
-///
-/// The word must contain at least one uppercase letter after the first character
-/// and consist only of ASCII alphanumeric characters.
-fn is_camel_case(word: &str) -> bool {
-    if word.len() < 2 {
-        return false;
-    }
-    // Must be all alphanumeric
-    if !word.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    // Must have at least one uppercase letter after the first char
-    word[1..].chars().any(|c| c.is_ascii_uppercase())
-}
-
-/// Generates suffix-based stem variants for a set of symbols.
-///
-/// For each symbol, tries common suffixes (e.g. "authenticate" generates
-/// "authentication", "authenticator", "authenticated"). Only produces
-/// variants that differ from the original and from other symbols.
-fn generate_stem_variants(symbols: &[String]) -> Vec<String> {
-    /// Common English derivational suffixes, ordered longest-first so that
-    /// stripping "ation" is preferred over "ion" when both match.
-    const SUFFIX_PAIRS: &[(&str, &[&str])] = &[
-        ("tion", &["te", "tor", "t", "ting"]),
-        ("sion", &["de", "d", "ding"]),
-        ("ment", &["", "ing", "ed"]),
-        ("ness", &["", "ly"]),
-        ("ing", &["", "e", "ion", "ment"]),
-        ("ed", &["", "e", "ing", "ion"]),
-        ("er", &["", "e", "ing", "ed"]),
-        ("or", &["", "e", "ion"]),
-        ("ly", &["", "ness"]),
-        ("ize", &["ization", "ized"]),
-        ("ise", &["isation", "ised"]),
-        ("ate", &["ation", "ator", "ated", "ating"]),
-        ("ify", &["ification", "ified"]),
-    ];
-
-    let existing: HashSet<String> = symbols.iter().map(|s| s.to_lowercase()).collect();
-    let mut variants: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    for symbol in symbols {
-        let lower = symbol.to_lowercase();
-        if lower.len() < 4 {
-            continue;
-        }
-
-        for &(suffix, replacements) in SUFFIX_PAIRS {
-            if let Some(stem) = lower.strip_suffix(suffix) {
-                if stem.len() < 2 {
-                    continue;
-                }
-                for &replacement in replacements {
-                    let variant = format!("{stem}{replacement}");
-                    if variant.len() >= 3
-                        && !existing.contains(&variant)
-                        && seen.insert(variant.clone())
-                    {
-                        variants.push(variant);
-                    }
-                }
-                break; // only strip the first matching suffix
-            }
-        }
-    }
-
-    variants
-}
-
 /// Extracts exact, namespace-qualified source tokens from the task and extra
 /// keywords. Surrounding prose punctuation and Markdown backticks are removed,
 /// but the original case is retained for case-sensitive literal matching.
+/// Shortest phrase accepted as exact-copy evidence. Two short words ("is not")
+/// would match half a codebase and turn the source scan into noise.
+const MIN_EXACT_PHRASE_LEN: usize = 8;
+
+/// Cap on phrase terms, so a keyword list can't make the source scan unbounded.
+const MAX_EXACT_PHRASES: usize = 8;
+
+/// Extracts multi-word phrases to be matched verbatim against file source.
+///
+/// A quoted phrase is the most specific evidence a caller can give — UI copy, a
+/// log line, an error message — and it is precisely what identifier extraction
+/// cannot represent, since it survives in the source as a string literal and
+/// nowhere in any symbol name. Left to FTS alone such a phrase loses: it may hit
+/// exactly one node in the codebase, but if that node is a large object literal
+/// (a localization catalog, say) BM25's length normalization scores the unique
+/// hit below hundreds of generic short matches, and the highest-signal evidence
+/// ranks last (#362).
+///
+/// Phrases come from two places: any caller-supplied keyword containing inner
+/// whitespace, and any double-quoted span in the task text. Single words are
+/// deliberately excluded — they are already handled by FTS, and scanning source
+/// for one common word would match everywhere.
+fn exact_phrase_terms(query: &str, extra_keywords: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut phrases = Vec::new();
+
+    let mut push = |candidate: &str, phrases: &mut Vec<String>| {
+        let phrase = candidate.trim();
+        if phrase.len() >= MIN_EXACT_PHRASE_LEN
+            && phrase.split_whitespace().count() >= 2
+            && seen.insert(phrase.to_string())
+        {
+            phrases.push(phrase.to_string());
+        }
+    };
+
+    for keyword in extra_keywords {
+        push(keyword, &mut phrases);
+    }
+    // Double-quoted spans in the task text: `"..."` pairs, in order.
+    let mut rest = query;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        push(&after[..close], &mut phrases);
+        rest = &after[close + 1..];
+    }
+
+    phrases.truncate(MAX_EXACT_PHRASES);
+    phrases
+}
+
 fn exact_source_terms(query: &str, extra_keywords: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     std::iter::once(query)
@@ -1281,6 +1220,7 @@ fn is_executable_kind(kind: &NodeKind) -> bool {
         kind,
         NodeKind::Function
             | NodeKind::Method
+            | NodeKind::SingletonMethod
             | NodeKind::StructMethod
             | NodeKind::Constructor
             | NodeKind::AbstractMethod
@@ -1555,60 +1495,75 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_terms_takes_multiword_keywords_verbatim() {
+        // The whole point: a quoted phrase survives in source as a string
+        // literal and appears in no symbol name, so it must be matched as-is.
+        let terms = exact_phrase_terms(
+            "Diagnose the dashboard",
+            &["Waiting for status".to_string()],
+        );
+        assert_eq!(terms, vec!["Waiting for status".to_string()]);
+    }
+
+    #[test]
+    fn exact_phrase_terms_rejects_single_words_and_short_phrases() {
+        // A single common word would match everywhere; FTS already covers it.
+        let terms = exact_phrase_terms(
+            "no quotes here",
+            &["dashboard".to_string(), "status".to_string()],
+        );
+        assert!(
+            terms.is_empty(),
+            "single words must not trigger a source scan"
+        );
+
+        // Two very short words are no more specific than one.
+        let terms = exact_phrase_terms("x", &["is не".to_string(), "a b".to_string()]);
+        assert!(
+            terms.is_empty(),
+            "sub-minimum phrases must be rejected: {terms:?}"
+        );
+    }
+
+    #[test]
+    fn exact_phrase_terms_extracts_quoted_spans_from_the_task() {
+        let terms = exact_phrase_terms(
+            r#"Why does it show "Waiting for status" instead of "Ready to go" now?"#,
+            &[],
+        );
+        assert_eq!(
+            terms,
+            vec!["Waiting for status".to_string(), "Ready to go".to_string()]
+        );
+    }
+
+    #[test]
+    fn exact_phrase_terms_ignores_an_unclosed_quote() {
+        let terms = exact_phrase_terms(r#"look for "Waiting for status"#, &[]);
+        assert!(
+            terms.is_empty(),
+            "an unterminated quote must not scan: {terms:?}"
+        );
+    }
+
+    #[test]
+    fn exact_phrase_terms_dedupes_and_caps() {
+        // Same phrase from both the keyword list and the task text counts once.
+        let terms = exact_phrase_terms(
+            r#"see "Waiting for status" please"#,
+            &["Waiting for status".to_string()],
+        );
+        assert_eq!(terms.len(), 1);
+
+        // The source scan reads every file, so the term list must stay bounded.
+        let many: Vec<String> = (0..40).map(|i| format!("phrase number {i}")).collect();
+        assert_eq!(exact_phrase_terms("x", &many).len(), MAX_EXACT_PHRASES);
+    }
+
+    #[test]
     fn test_filters_stop_words() {
         let symbols = extract_symbols_from_query("the is in for to a an");
         assert!(symbols.is_empty());
-    }
-
-    #[test]
-    fn test_is_camel_case() {
-        assert!(is_camel_case("UserService"));
-        assert!(is_camel_case("processRequest"));
-        assert!(!is_camel_case("user"));
-        assert!(!is_camel_case("U"));
-        assert!(!is_camel_case("process_request"));
-    }
-
-    // --- stem variant tests ---
-
-    #[test]
-    fn test_stem_variants_ate_suffix() {
-        let symbols = vec!["authenticate".to_string()];
-        let variants = generate_stem_variants(&symbols);
-        assert!(variants.contains(&"authentication".to_string()));
-        assert!(variants.contains(&"authenticator".to_string()));
-    }
-
-    #[test]
-    fn test_stem_variants_tion_suffix() {
-        let symbols = vec!["authentication".to_string()];
-        let variants = generate_stem_variants(&symbols);
-        assert!(variants.contains(&"authenticate".to_string()));
-    }
-
-    #[test]
-    fn test_stem_variants_ing_suffix() {
-        let symbols = vec!["parsing".to_string()];
-        let variants = generate_stem_variants(&symbols);
-        // "parsing" → strip "ing" → stem "pars" → ["pars", "parse", "parsion", "parsment"]
-        assert!(variants.contains(&"parse".to_string()));
-    }
-
-    #[test]
-    fn test_stem_variants_short_words_skipped() {
-        let symbols = vec!["ab".to_string()];
-        let variants = generate_stem_variants(&symbols);
-        assert!(variants.is_empty());
-    }
-
-    #[test]
-    fn test_stem_variants_no_duplicates_with_existing() {
-        let symbols = vec!["authenticate".to_string(), "authentication".to_string()];
-        let variants = generate_stem_variants(&symbols);
-        // "authentication" is already in symbols, so it shouldn't appear in variants
-        assert!(!variants.contains(&"authentication".to_string()));
-        // "authenticate" is already in symbols, so it shouldn't appear in variants
-        assert!(!variants.contains(&"authenticate".to_string()));
     }
 
     // --- co-occurrence boost tests ---

@@ -165,6 +165,44 @@ pub(crate) fn unique_file_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec
     result
 }
 
+/// Advice attached wherever sibling projects are surfaced.
+pub(crate) const SIBLING_HINT: &str =
+    "Other initialized projects sit beside this one. If a symbol is missing here, \
+     retry the same call with graph_root set to one of them.";
+
+/// Returns the initialized projects sitting directly beside `project_root`.
+///
+/// Best-effort like every other global-DB read: an unavailable global DB yields
+/// no siblings rather than an error, since this only ever adds a hint.
+pub(crate) async fn sibling_projects(project_root: &std::path::Path) -> Vec<String> {
+    match crate::global_db::GlobalDb::open().await {
+        Some(gdb) => gdb.sibling_projects(project_root).await,
+        None => Vec::new(),
+    }
+}
+
+/// Builds the empty-result payload naming reachable sibling graphs, if any.
+///
+/// Returns `None` when the caller has results to return, or when no sibling
+/// project exists — in both cases the ordinary response shape is kept.
+pub(crate) async fn sibling_note(
+    is_empty: bool,
+    project_root: &std::path::Path,
+) -> Option<serde_json::Value> {
+    if !is_empty {
+        return None;
+    }
+    let siblings = sibling_projects(project_root).await;
+    if siblings.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "results": [],
+        "sibling_projects": siblings,
+        "hint": SIBLING_HINT,
+    }))
+}
+
 /// Truncates a string to the maximum response character limit, appending
 /// a truncation notice if necessary.
 pub(crate) fn truncate_response(s: &str) -> String {
@@ -284,6 +322,7 @@ pub async fn handle_tool_call(
         "tokensave_diff_context" => git::handle_diff_context(cg, args).await,
         "tokensave_module_api" => analysis::handle_module_api(cg, args, scope_prefix).await,
         "tokensave_circular" => analysis::handle_circular(cg, args).await,
+        "tokensave_imports" => analysis::handle_imports(cg, args).await,
         "tokensave_hotspots" => analysis::handle_hotspots(cg, args, scope_prefix).await,
         "tokensave_similar" => graph::handle_similar(cg, args).await,
         "tokensave_rename_preview" => graph::handle_rename_preview(cg, args).await,
@@ -388,9 +427,9 @@ mod tests {
         // tool that will instantly fail. The count and the per-tool checks
         // below adapt to the host's capability set.
         let expected_total = if super::super::definitions::ast_grep_available() {
-            83
+            84
         } else {
-            82
+            83
         };
         assert_eq!(tools.len(), expected_total);
 
@@ -411,6 +450,7 @@ mod tests {
         assert!(tool_names.contains(&"tokensave_impact"));
         assert!(tool_names.contains(&"tokensave_node"));
         assert!(tool_names.contains(&"tokensave_status"));
+        assert!(tool_names.contains(&"tokensave_imports"));
         assert!(tool_names.contains(&"tokensave_files"));
         assert!(tool_names.contains(&"tokensave_affected"));
         assert!(tool_names.contains(&"tokensave_dead_code"));
@@ -565,10 +605,19 @@ mod tests {
             always_load.contains(&"tokensave_status"),
             "tokensave_status must be alwaysLoad"
         );
+        // Structural call-graph tools promoted to alwaysLoad in #333.
+        assert!(
+            always_load.contains(&"tokensave_impact"),
+            "tokensave_impact must be alwaysLoad"
+        );
+        assert!(
+            always_load.contains(&"tokensave_callees"),
+            "tokensave_callees must be alwaysLoad"
+        );
         assert_eq!(
             always_load.len(),
-            3,
-            "exactly 3 tools should be alwaysLoad, got {:?}",
+            5,
+            "exactly 5 tools should be alwaysLoad, got {:?}",
             always_load
         );
     }

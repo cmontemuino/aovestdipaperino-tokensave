@@ -15,6 +15,8 @@ pub enum NodeKind {
     Trait,
     Function,
     Method,
+    /// A Ruby method defined on the enclosing class/module singleton.
+    SingletonMethod,
     Impl,
     Const,
     Static,
@@ -103,6 +105,7 @@ impl NodeKind {
             NodeKind::Trait => "trait",
             NodeKind::Function => "function",
             NodeKind::Method => "method",
+            NodeKind::SingletonMethod => "singleton_method",
             NodeKind::Impl => "impl",
             NodeKind::Const => "const",
             NodeKind::Static => "static",
@@ -178,6 +181,7 @@ impl NodeKind {
             "trait" => Some(NodeKind::Trait),
             "function" => Some(NodeKind::Function),
             "method" => Some(NodeKind::Method),
+            "singleton_method" => Some(NodeKind::SingletonMethod),
             "impl" => Some(NodeKind::Impl),
             "const" => Some(NodeKind::Const),
             "static" => Some(NodeKind::Static),
@@ -258,6 +262,12 @@ pub enum EdgeKind {
     Receives,
     /// A documentation file describes a source file (#154).
     Documents,
+    /// An HDL module or interface instantiates another (#344).
+    ///
+    /// Kept distinct from `Calls`: a module instantiation is structural
+    /// hierarchy, not invocation, and folding it into `Calls` would pollute
+    /// callers/callees, impact, and dead-code for every other language.
+    Instantiates,
 }
 
 #[allow(clippy::should_implement_trait)]
@@ -276,6 +286,7 @@ impl EdgeKind {
             EdgeKind::Annotates => "annotates",
             EdgeKind::Receives => "receives",
             EdgeKind::Documents => "documents",
+            EdgeKind::Instantiates => "instantiates",
         }
     }
 
@@ -293,6 +304,7 @@ impl EdgeKind {
             "annotates" => Some(EdgeKind::Annotates),
             "receives" => Some(EdgeKind::Receives),
             "documents" => Some(EdgeKind::Documents),
+            "instantiates" => Some(EdgeKind::Instantiates),
             _ => None,
         }
     }
@@ -393,6 +405,49 @@ pub struct Edge {
     pub line: Option<u32>,
 }
 
+/// What kind of file a [`FileRecord`] describes.
+///
+/// Artifacts are tracked so that path-shaped questions ("where are the
+/// `.feature` files?") can be answered from the graph instead of a blocked
+/// shell command (#323). They are deliberately distinguishable from source:
+/// a source file with no extractable symbols is a fact about the code, while
+/// an artifact never had symbols to begin with, and analyses that mean "code"
+/// must not count them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileKind {
+    /// A source file processed by a language extractor.
+    #[default]
+    Code,
+    /// A non-source file tracked by path only; never parsed.
+    Artifact,
+}
+
+impl FileKind {
+    /// Returns the stored string form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Artifact => "artifact",
+        }
+    }
+
+    /// Parses the stored string form, defaulting to [`FileKind::Code`].
+    ///
+    /// Rows written before the `kind` column existed are source files, and so
+    /// is anything unrecognized: mislabelling an artifact as code hides it from
+    /// one filter, while the reverse would drop real source out of analyses.
+    #[must_use]
+    pub fn from_str_or_code(value: &str) -> Self {
+        if value == "artifact" {
+            Self::Artifact
+        } else {
+            Self::Code
+        }
+    }
+}
+
 /// Record tracking an indexed file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -402,6 +457,8 @@ pub struct FileRecord {
     pub modified_at: i64,
     pub indexed_at: i64,
     pub node_count: u32,
+    #[serde(default)]
+    pub kind: FileKind,
 }
 
 /// An unresolved reference found during parsing, to be resolved later.
@@ -728,6 +785,7 @@ pub struct AstGrepResult {
 
 /// A single parsed turn from a Claude Code session transcript,
 /// ready for DB insertion into the `turns` table.
+#[derive(Debug, Clone)]
 pub struct CostTurn {
     pub message_id: String,
     pub project_hash: String,
@@ -741,4 +799,8 @@ pub struct CostTurn {
     pub cost_usd: f64,
     pub category: String,
     pub tool_names: String,
+    /// Source agent identity. Values include "claude" or "droid".
+    pub agent: String,
+    /// Agent-native credit units (Droid only). None for Claude turns.
+    pub credits: Option<u64>,
 }

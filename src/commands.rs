@@ -84,16 +84,16 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
                 });
             }
 
-            // Copy DB
-            let sanitized = branch::sanitize_branch_name(&branch_name);
-            let branches_dir = branch_meta::ensure_branches_dir(&tokensave_dir)?;
-            let new_db_path = branches_dir.join(format!("{sanitized}.db"));
+            // Copy DB (collision-safe db_file: distinct branches that sanitize
+            // to the same stem get a hash-suffixed name instead of sharing one).
+            let db_file = branch::unique_branch_db_file(&meta, &branch_name);
+            branch_meta::ensure_branches_dir(&tokensave_dir)?;
+            let new_db_path = tokensave_dir.join(&db_file);
             let spinner = Spinner::new();
             spinner.set_message(&format!("copying DB from '{parent}'"));
-            std::fs::copy(&parent_db, &new_db_path)?;
+            branch::copy_branch_db(&parent_db, &new_db_path).await?;
 
             // Save metadata BEFORE open() so it resolves the new branch to its DB
-            let db_file = format!("branches/{sanitized}.db");
             meta.add_branch(&branch_name, &db_file, &parent);
             branch_meta::save_branch_meta(&tokensave_dir, &meta)?;
 
@@ -442,8 +442,13 @@ async fn is_fresh_install() -> bool {
 pub(crate) async fn handle_no_command() -> tokensave::errors::Result<()> {
     let project_path = tokensave::config::resolve_path(None);
     if TokenSave::is_initialized(&project_path) {
-        // Already initialized — show help via clap
-        let _ = <crate::cli::Cli as clap::CommandFactory>::command().print_help();
+        // Already initialized — render help to stderr, never stdout. Agent
+        // permission hooks invoke a bare `tokensave` and parse stdout as JSON;
+        // help text there is a fatal parse error that fail-closes the wrapped
+        // command. An empty stdout with exit 0 reads as "no opinion" instead.
+        // See #347, #348, #351.
+        let mut cmd = <crate::cli::Cli as clap::CommandFactory>::command();
+        eprint!("{}", cmd.render_help());
         eprintln!();
         return Ok(());
     }
@@ -454,6 +459,16 @@ pub(crate) async fn handle_no_command() -> tokensave::errors::Result<()> {
              in your project root."
         );
         eprintln!();
+    }
+    // Never prompt when stdin isn't a terminal. A hook pipes its JSON payload
+    // into a bare `tokensave`; reading it here would consume that payload and
+    // could be mistaken for a "yes", spuriously initializing the project (#351).
+    if !io::stdin().is_terminal() {
+        eprintln!(
+            "No TokenSave index found at '{}'. Run `tokensave init` to create one.",
+            project_path.display()
+        );
+        return Ok(());
     }
     eprint!(
         "No TokenSave index found at '{}'. Create one now? [Y/n] ",
@@ -497,33 +512,38 @@ pub(crate) async fn init_and_index(
         // diff; offer the tracked .gitignore as an explicit opt-in.
         //
         // Skipped entirely outside a git working tree — neither answer has any
-        // effect there — and when stdin isn't a TTY, so a scripted or
-        // agent-driven `init` never consumes a line of the caller's stdin and
-        // takes it for an answer (#288). Success is reported only when the
-        // helper confirms the entry was actually written.
+        // effect there. When stdin isn't a TTY, the prompt is skipped so a
+        // scripted or agent-driven `init` never consumes a line of the caller's
+        // stdin and takes it for an answer (#288), but the write itself needs
+        // no answer, so the default local exclusion is still applied (#373).
+        // Success is reported only when the helper confirms the entry was
+        // actually written.
         if tokensave::config::is_inside_git_repo(project_path)
             && !tokensave::config::is_in_gitignore(project_path)
-            && io::stdin().is_terminal()
         {
-            eprint!(
-                "Exclude .tokensave from git? [Y] .git/info/exclude (local) / [g] .gitignore (tracked) / [n] no "
-            );
-            io::stderr().flush().ok();
-            let mut answer = String::new();
-            if io::stdin().lock().read_line(&mut answer).is_ok() {
-                let answer = answer.trim();
-                let reported = if answer.eq_ignore_ascii_case("g") {
-                    tokensave::config::add_to_gitignore(project_path)
-                        .then_some("Added .tokensave to .gitignore")
-                } else if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
-                    tokensave::config::add_to_git_info_exclude(project_path)
-                        .then_some("Added .tokensave/ to .git/info/exclude (local, untracked)")
-                } else {
-                    None
-                };
-                if let Some(message) = reported {
-                    eprintln!("{message}");
+            if io::stdin().is_terminal() {
+                eprint!(
+                    "Exclude .tokensave from git? [Y] .git/info/exclude (local) / [g] .gitignore (tracked) / [n] no "
+                );
+                io::stderr().flush().ok();
+                let mut answer = String::new();
+                if io::stdin().lock().read_line(&mut answer).is_ok() {
+                    let answer = answer.trim();
+                    let reported = if answer.eq_ignore_ascii_case("g") {
+                        tokensave::config::add_to_gitignore(project_path)
+                            .then_some("Added .tokensave to .gitignore")
+                    } else if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+                        tokensave::config::add_to_git_info_exclude(project_path)
+                            .then_some("Added .tokensave/ to .git/info/exclude (local, untracked)")
+                    } else {
+                        None
+                    };
+                    if let Some(message) = reported {
+                        eprintln!("{message}");
+                    }
                 }
+            } else if tokensave::config::add_to_git_info_exclude(project_path) {
+                eprintln!("Added .tokensave/ to .git/info/exclude (local, untracked)");
             }
         }
         cg
@@ -559,6 +579,11 @@ pub(crate) async fn init_and_index(
         "indexing done — {} files, {} nodes, {} edges in {}ms",
         result.file_count, result.node_count, result.edge_count, result.duration_ms
     ));
+    if !verbose {
+        // Verbose already emitted the full per-extension list mid-run, so the
+        // compact headline (and its "rerun with --verbose" hint) would repeat it.
+        print_skipped_extension_summary(&result.skipped_extensions);
+    }
     global::update_global_db(&cg).await;
     Ok(cg)
 }
@@ -747,6 +772,51 @@ pub async fn handle_discover(since: &str, json_output: bool) -> tokensave::error
     Ok(())
 }
 
+/// Cap on how many per-extension entries the compact skipped summary lists
+/// before rolling the rest into a single "and N more" tail.
+const MAX_SUMMARY_EXTS: usize = 5;
+
+/// Build the compact skipped-file headline shown after `init` and `sync`
+/// (#345), or `None` when nothing was skipped.
+///
+/// Aggregated by extension so a large repository never prints thousands of
+/// paths; `--doctor` and `--verbose` remain the detailed modes.
+pub(crate) fn skipped_extension_headline(skipped: &[(String, usize)]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let total: usize = skipped.iter().map(|(_, count)| count).sum();
+    let listed = skipped
+        .iter()
+        .take(MAX_SUMMARY_EXTS)
+        .map(|(ext, count)| format!(".{ext} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = skipped.len().saturating_sub(MAX_SUMMARY_EXTS);
+    let more = if rest > 0 {
+        format!(", and {rest} more extension(s)")
+    } else {
+        String::new()
+    };
+    let plural = if total == 1 { "" } else { "s" };
+    Some(format!(
+        "Skipped {total} tracked file{plural} (unsupported extension): {listed}{more}"
+    ))
+}
+
+/// Print the compact skipped-file summary after `init` or `sync` so an index
+/// that omitted unsupported languages cannot be mistaken for a complete one.
+pub(crate) fn print_skipped_extension_summary(skipped: &[(String, usize)]) {
+    if let Some(headline) = skipped_extension_headline(skipped) {
+        eprintln!();
+        eprintln!("\x1b[33m{headline}\x1b[0m");
+        eprintln!(
+            "\x1b[2m  No extractor is registered for these extensions. \
+             Rerun with --doctor (or --verbose) for the full list.\x1b[0m"
+        );
+    }
+}
+
 /// Print the `--doctor` report after an incremental sync.
 pub(crate) fn print_sync_doctor(result: &tokensave::tokensave::SyncResult) {
     // Unsupported-extension summary (#262, #270): makes "not indexed because
@@ -808,5 +878,61 @@ mod gain_tests {
     #[test]
     fn dollars_zero_for_zero_tokens() {
         assert_eq!(estimate_dollars_saved(0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod skipped_summary_tests {
+    use super::skipped_extension_headline;
+
+    fn skipped(entries: &[(&str, usize)]) -> Vec<(String, usize)> {
+        entries
+            .iter()
+            .map(|(ext, count)| ((*ext).to_string(), *count))
+            .collect()
+    }
+
+    #[test]
+    fn no_headline_when_nothing_skipped() {
+        assert_eq!(skipped_extension_headline(&[]), None);
+    }
+
+    #[test]
+    fn single_file_uses_singular_wording() {
+        assert_eq!(
+            skipped_extension_headline(&skipped(&[("v", 1)])).unwrap(),
+            "Skipped 1 tracked file (unsupported extension): .v (1)"
+        );
+    }
+
+    #[test]
+    fn totals_are_summed_across_extensions() {
+        let headline = skipped_extension_headline(&skipped(&[("v", 2), ("sv", 1)])).unwrap();
+        assert_eq!(
+            headline,
+            "Skipped 3 tracked files (unsupported extension): .v (2), .sv (1)"
+        );
+    }
+
+    #[test]
+    fn long_lists_are_rolled_up() {
+        let headline = skipped_extension_headline(&skipped(&[
+            ("a", 1),
+            ("b", 1),
+            ("c", 1),
+            ("d", 1),
+            ("e", 1),
+            ("f", 1),
+            ("g", 1),
+        ]))
+        .unwrap();
+        assert!(
+            headline.ends_with(".e (1), and 2 more extension(s)"),
+            "got: {headline}"
+        );
+        assert!(
+            headline.starts_with("Skipped 7 tracked files"),
+            "got: {headline}"
+        );
     }
 }

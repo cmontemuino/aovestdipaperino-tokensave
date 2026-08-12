@@ -68,6 +68,7 @@ pub struct Database {
     conn: Connection,
     /// Kept alive so the underlying database is not dropped.
     _db: LibsqlDatabase,
+    read_only: bool,
     pub(super) trait_dispatch_callers: RwLock<HashMap<String, Vec<CachedTraitDispatchCaller>>>,
 }
 
@@ -120,6 +121,7 @@ impl Database {
         let database = Self {
             conn,
             _db: db,
+            read_only: false,
             trait_dispatch_callers: RwLock::new(HashMap::new()),
         };
         database.refresh_trait_dispatch_callers().await?;
@@ -166,15 +168,105 @@ impl Database {
         let database = Self {
             conn,
             _db: db,
+            read_only: false,
             trait_dispatch_callers: RwLock::new(HashMap::new()),
         };
         database.refresh_trait_dispatch_callers().await?;
         Ok((database, migrated))
     }
 
+    /// Opens a current, checkpointed database without changing it.
+    pub async fn open_read_only(db_path: &Path) -> Result<Self> {
+        let mut attempt = 1;
+        loop {
+            match Self::try_open_read_only(db_path).await {
+                Ok(database) => return Ok(database),
+                Err(error)
+                    if attempt < DB_CONNECT_MAX_ATTEMPTS && is_transient_connect_error(&error) =>
+                {
+                    tokio::time::sleep(connect_retry_backoff(attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn try_open_read_only(db_path: &Path) -> Result<Self> {
+        let db = libsql::Builder::new_local(db_path)
+            .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .build()
+            .await
+            .map_err(|error| TokenSaveError::Database {
+                message: format!("failed to open database read-only: {error}"),
+                operation: "open_read_only".to_string(),
+            })?;
+        let conn = db.connect().map_err(|error| TokenSaveError::Database {
+            message: format!("failed to connect to database read-only: {error}"),
+            operation: "open_read_only".to_string(),
+        })?;
+
+        conn.execute_batch("PRAGMA query_only = 1; PRAGMA busy_timeout = 120000;")
+            .await
+            .map_err(|error| TokenSaveError::Database {
+                message: format!("failed to apply read-only pragmas: {error}"),
+                operation: "open_read_only".to_string(),
+            })?;
+
+        let mut rows = conn
+            .query("PRAGMA user_version", ())
+            .await
+            .map_err(|error| TokenSaveError::Database {
+                message: format!("failed to read database schema version: {error}"),
+                operation: "open_read_only".to_string(),
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| TokenSaveError::Database {
+                message: format!("failed to read database schema version: {error}"),
+                operation: "open_read_only".to_string(),
+            })?
+            .ok_or_else(|| TokenSaveError::Database {
+                message: "database did not report a schema version".to_string(),
+                operation: "open_read_only".to_string(),
+            })?;
+        let version: i64 = row.get(0).map_err(|error| TokenSaveError::Database {
+            message: format!("failed to decode database schema version: {error}"),
+            operation: "open_read_only".to_string(),
+        })?;
+        let latest = migrations::latest_version();
+        if version != i64::from(latest) {
+            let remedy = if version < i64::from(latest) {
+                "run `tokensave sync` in the selected project to migrate it"
+            } else {
+                "upgrade Tokensave to a version compatible with the selected project"
+            };
+            return Err(TokenSaveError::Config {
+                message: format!(
+                    "database schema version {version} does not match required version {latest}; {remedy}"
+                ),
+            });
+        }
+
+        let database = Self {
+            conn,
+            _db: db,
+            read_only: true,
+            trait_dispatch_callers: RwLock::new(HashMap::new()),
+        };
+        database.refresh_trait_dispatch_callers().await?;
+        Ok(database)
+    }
+
     /// Returns a reference to the underlying libsql connection.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Returns whether this handle was explicitly opened in read-only mode.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Consumes the `Database`, closing the underlying connection.
@@ -268,6 +360,42 @@ impl Database {
         }
     }
 
+    /// Returns `true` when a bulk load dropped its indexes but never finalized.
+    ///
+    /// The signature is an `edges` table that exists yet has no
+    /// `idx_edges_unique` index: `begin_bulk_load` drops that index up front,
+    /// and only `end_bulk_load` recreates it, so its absence means the load
+    /// was interrupted in between. `PRAGMA quick_check` cannot see this — the
+    /// rows are structurally valid, just un-indexed and possibly duplicated —
+    /// so recovery-on-open relies on this check instead (#318). Returns
+    /// `false` when the `edges` table is absent (nothing to finalize).
+    pub async fn needs_bulk_load_finalization(&self) -> Result<bool> {
+        let mut names = self
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')",
+                (),
+            )
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to inspect schema for bulk-load state: {e}"),
+                operation: "needs_bulk_load_finalization".to_string(),
+            })?;
+        let mut has_edges = false;
+        let mut has_unique_index = false;
+        while let Some(row) = names.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read schema row: {e}"),
+            operation: "needs_bulk_load_finalization".to_string(),
+        })? {
+            match row.get::<String>(0).unwrap_or_default().as_str() {
+                "edges" => has_edges = true,
+                "idx_edges_unique" => has_unique_index = true,
+                _ => {}
+            }
+        }
+        Ok(has_edges && !has_unique_index)
+    }
+
     /// Rebuilds the FTS5 index from the content table.
     ///
     /// This fixes FTS-only corruption (e.g. from an interrupted bulk load)
@@ -348,9 +476,21 @@ impl Database {
 
     /// Recreates secondary indexes (benefiting from sorted row order),
     /// restores FTS triggers and content, and re-enables normal durability.
+    ///
+    /// `begin_bulk_load` drops `idx_edges_unique`, so the `INSERT OR IGNORE`
+    /// edge writers cannot dedupe while a load is in flight. This method first
+    /// collapses any duplicate edge tuples — keeping the lowest `rowid` per
+    /// `(source, target, kind, COALESCE(line, -1))` — so the subsequent
+    /// `CREATE UNIQUE INDEX idx_edges_unique` cannot fail on residual
+    /// duplicates and leave the graph permanently un-indexed (#318).
     pub async fn end_bulk_load(&self) -> Result<()> {
         self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
+            "DELETE FROM edges
+             WHERE rowid NOT IN (
+                 SELECT MIN(rowid) FROM edges
+                 GROUP BY source, target, kind, COALESCE(line, -1)
+             );
+             CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
              CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
              CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);
              CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);
@@ -363,21 +503,21 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_unresolved_refs_reference_name ON unresolved_refs(reference_name);
              CREATE INDEX IF NOT EXISTS idx_unresolved_refs_file_path ON unresolved_refs(file_path);
              CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
              END;
              CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature)
-                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
+                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
              END;
              CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
-                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature)
-                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
-                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
              END;
-             INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-                 SELECT rowid, name, qualified_name, docstring, signature FROM nodes;
+             INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+                 SELECT rowid, name, qualified_name, docstring, signature, search_terms FROM nodes;
              PRAGMA foreign_keys = ON;",
         ).await.map_err(|e| TokenSaveError::Database {
             message: format!("failed to end bulk load: {e}"),

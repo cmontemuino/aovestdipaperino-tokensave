@@ -94,6 +94,10 @@ pub struct IndexResult {
     pub edge_count: usize,
     /// Time taken in milliseconds.
     pub duration_ms: u64,
+    /// Source-like extensions skipped because no registered extractor
+    /// handles them, as `(extension, file_count)` sorted by count
+    /// descending (#345). Known binary/asset extensions are omitted.
+    pub skipped_extensions: Vec<(String, usize)>,
 }
 
 /// Result of an incremental sync operation.
@@ -201,18 +205,11 @@ impl TokenSave {
         // a real per-branch DB instead of silently falling back. Best-effort —
         // never fail open() on this. Gated by config.auto_track, overridable
         // per-run via TOKENSAVE_AUTO_TRACK (git-hook path is separate).
-        let auto_track = match std::env::var("TOKENSAVE_AUTO_TRACK") {
-            // Present → enabled unless an explicit falsey value.
-            Ok(v) => !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off" | ""
-            ),
-            // Absent → fall back to the per-project config (default false).
-            Err(_) => config.auto_track,
-        };
+        let auto_track =
+            crate::config::env_bool_override("TOKENSAVE_AUTO_TRACK", config.auto_track);
         if auto_track {
             if let Some(b) = active_branch.as_deref() {
-                match branch::track_branch_copy(project_root, &tokensave_dir, b) {
+                match branch::track_branch_copy(project_root, &tokensave_dir, b).await {
                     Ok(true) => eprintln!(
                         "[tokensave] auto-tracked branch '{b}' (index copied from \
                          ancestor; run `tokensave sync` to refresh)"
@@ -299,6 +296,19 @@ impl TokenSave {
                 eprintln!("[tokensave] re-index complete.");
                 return Ok(ts);
             }
+            // `quick_check` validates the B-tree but cannot see a bulk load
+            // that dropped its indexes and never recreated them: the rows are
+            // structurally valid, just un-indexed and possibly duplicated
+            // (#318). Detect that state and re-run finalization, which dedupes
+            // the edges and rebuilds every dropped index — far cheaper than a
+            // full re-index and enough to restore a correct, fast graph.
+            if db.needs_bulk_load_finalization().await.unwrap_or(false) {
+                eprintln!(
+                    "[tokensave] previous bulk load did not finalize — deduping edges and rebuilding indexes…"
+                );
+                db.end_bulk_load().await?;
+            }
+
             // DB is fine — clean up the stale sentinel.
             clear_dirty_sentinel(project_root);
         }
@@ -396,6 +406,75 @@ impl TokenSave {
         )
     }
 
+    /// Opens an initialized project database without mutating it.
+    pub async fn open_read_only(project_root: &Path, branch_name: Option<&str>) -> Result<Self> {
+        let tokensave_dir = get_tokensave_dir(project_root);
+        if !tokensave_dir.join("config.json").is_file() {
+            return Err(TokenSaveError::Config {
+                message: format!(
+                    "'{}' is not an initialized TokenSave project root; \
+                     run `tokensave init` there",
+                    project_root.display()
+                ),
+            });
+        }
+
+        let config = load_config(project_root)?;
+        let active_branch = branch_name
+            .map(str::to_owned)
+            .or_else(|| branch::current_branch(project_root));
+
+        let (db_path, serving_branch, fallback_warning) = if let Some(explicit) = branch_name {
+            let meta = branch_meta::load_branch_meta(&tokensave_dir).ok_or_else(|| {
+                TokenSaveError::Config {
+                    message: "no branch tracking configured; run `tokensave branch add` first"
+                        .to_string(),
+                }
+            })?;
+            let path = branch::resolve_branch_db_path(&tokensave_dir, explicit, &meta).ok_or_else(
+                || TokenSaveError::Config {
+                    message: format!(
+                        "branch '{explicit}' is not tracked; run `tokensave branch add {}` \
+                         in the selected project to track it",
+                        shell_quote(explicit)
+                    ),
+                },
+            )?;
+            if !path.is_file() {
+                return Err(TokenSaveError::Config {
+                    message: format!(
+                        "branch '{explicit}' is tracked but its DB is missing at '{}'; \
+                         run `tokensave sync` in the selected project",
+                        path.display()
+                    ),
+                });
+            }
+            (path, Some(explicit.to_string()), None)
+        } else {
+            Self::resolve_db_for_branch(project_root, &tokensave_dir, active_branch.as_deref())
+        };
+
+        if !db_path.is_file() {
+            return Err(TokenSaveError::Config {
+                message: format!(
+                    "no TokenSave database found at '{}'; run `tokensave init` first",
+                    db_path.display()
+                ),
+            });
+        }
+
+        let db = Database::open_read_only(&db_path).await?;
+        Ok(Self {
+            db,
+            config,
+            project_root: project_root.to_path_buf(),
+            registry: LanguageRegistry::new(),
+            active_branch,
+            serving_branch,
+            fallback_warning,
+        })
+    }
+
     /// Opens a specific branch's DB for read-only queries.
     ///
     /// Returns an error if the branch is not tracked or the DB doesn't exist.
@@ -412,7 +491,11 @@ impl TokenSave {
 
         let db_path = branch::resolve_branch_db_path(&tokensave_dir, branch_name, &meta)
             .ok_or_else(|| TokenSaveError::Config {
-                message: format!("branch '{branch_name}' is not tracked"),
+                message: format!(
+                    "branch '{branch_name}' is not tracked; run `tokensave branch add {}` \
+                     to track it",
+                    shell_quote(branch_name)
+                ),
             })?;
 
         if !db_path.exists() {

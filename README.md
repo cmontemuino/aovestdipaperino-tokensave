@@ -190,11 +190,11 @@ This creates a `.tokensave/` directory with the knowledge graph database. Initia
 
 #### PreToolUse hook
 
-The hook runs `tokensave hook-pre-tool-use` -- a native Rust command (no bash or jq required). It intercepts Agent, Grep, and Bash tool calls: Explore agents are blocked outright, and symbol-shaped grep/rg/ag invocations (plain identifiers, alternations, `\b`-wrapped names) are redirected to the matching tokensave MCP tool. Regex patterns, file-discovery modes, `git grep`, and piped commands pass through untouched; set `TOKENSAVE_DISABLE_GREP_HOOK=1` to opt out per shell.
+The hook runs `tokensave hook-pre-tool-use` -- a native Rust command (no bash or jq required). It intercepts Agent, Grep, Glob, and Bash tool calls: Explore agents are blocked outright, symbol-shaped grep/rg/ag invocations (plain identifiers, alternations, `\b`-wrapped names) are redirected to the matching tokensave MCP tool, and path-shaped discovery (`Glob`, `find -name`, `fd --extension`) over code extensions is redirected to `tokensave_files`. Regex patterns, `git grep`, piped commands, non-code extensions, search roots outside the index, and `find` predicates that change what the command does (`-exec`, `-delete`, `-mtime`) all pass through untouched; set `TOKENSAVE_DISABLE_GREP_HOOK=1` to opt out per shell.
 
 Filters are read most-specific-first: an explicit `type` is authoritative, then an explicit file glob, then the search path. A documentation search such as `path: "."` with `glob: "**/*.md"` therefore passes through rather than being treated as a code search on the broad path, while a code-only glob (`**/*.rs`) still redirects even under a non-code path. Mixed globs (`**/*.{rs,md}`) pass through, since they can return documentation.
 
-**Headless / subagent dispatch (`claude -p`).** Child processes dispatched by an orchestrating session inherit its `~/.claude/settings.json`, including this hook. To let a child run raw searches, set `TOKENSAVE_DISABLE_GREP_HOOK=1` in the child's environment -- the native binary honors it and passes every path (Grep, Bash, Agent) through, so there is no need for the blunt `--settings '{"hooks": {}}'` that strips *all* hooks. The guardrail is stateless: it never consults citation history, so it only ever redirects the symbol-shaped searches described above and steers untyped research fan-out; ordinary commands are unaffected whether the session is interactive or headless.
+**Headless / subagent dispatch (`claude -p`).** Child processes dispatched by an orchestrating session inherit its `~/.claude/settings.json`, including this hook. To let a child run raw searches, set `TOKENSAVE_DISABLE_GREP_HOOK=1` in the child's environment -- the native binary honors it and passes every path (Grep, Glob, Bash, Agent) through, so there is no need for the blunt `--settings '{"hooks": {}}'` that strips *all* hooks. The guardrail is stateless: it never consults citation history, so it only ever redirects the symbol-shaped searches described above and steers untyped research fan-out; ordinary commands are unaffected whether the session is interactive or headless.
 
 #### CLAUDE.md rules
 
@@ -409,6 +409,52 @@ Different from the criterion bench above: criterion measures per-iteration laten
 
 The server exposes more than 80 tools (one fewer when the optional `ast-grep` binary is not on `PATH`); the tables below group the most commonly used ones by category. Most are read-only, safe to call in parallel, and annotated with `readOnlyHint`. The edit primitives are scoped to single files and re-index in place; session baseline and memory-recording tools also mutate local `.tokensave` state and are annotated as non-read-only. The three core tools (`tokensave_context`, `tokensave_search`, `tokensave_status`) are marked `anthropic/alwaysLoad` so they bypass the client's tool-search round-trip.
 
+### Query another initialized project
+
+Semantic read tools can query an explicitly selected local graph without
+restarting the MCP server:
+
+```json
+{
+  "query": "screenGate",
+  "graph_root": "/absolute/path/to/typewhisper"
+}
+```
+
+Selected results include canonical root/branch provenance. Node IDs are
+namespaced to that graph, and the matching selectors must be repeated on
+follow-up calls. For example, a follow-up to a branch-selected query includes
+both values:
+
+```json
+{
+  "node_id": "graph:<fingerprint>:function:<raw-id>",
+  "graph_root": "/absolute/path/to/typewhisper",
+  "graph_branch": "feature/auth"
+}
+```
+
+`graph_root` must be the exact absolute root of an already initialized project.
+`graph_branch` is optional and, when supplied, must name a tracked branch.
+Selected opens are read-only: they never initialize, sync, migrate, auto-track,
+or write graph/source data. They also do not contribute to savings accounting.
+Calls without selectors behave exactly as before.
+
+`graph_root` is only useful if you know the other project exists, so the server
+tells you: initialized projects sitting directly beside the served root are
+named in the MCP `instructions`, in `tokensave_status`, and in empty
+`tokensave_search` / `tokensave_context` results — the point at which a session
+would otherwise conclude a symbol does not exist rather than look next door
+(#375). Only immediate siblings are offered, at most five, and nothing is opened
+or indexed on their behalf; querying one still requires an explicit `graph_root`.
+
+Selectors are intentionally unavailable on tools that write, shell out, or
+depend on the current checkout: the edit primitives, VCS and branch tools,
+diagnostics and test execution, dependency and runtime introspection, workflow
+and session-memory tools, the persistent-cache tool (`tokensave_redundancy`),
+and server administration. Those tools reject a selector instead of silently
+ignoring it.
+
 ### Discovery
 
 | Tool | Purpose |
@@ -416,13 +462,24 @@ The server exposes more than 80 tools (one fewer when the optional `ast-grep` bi
 | `tokensave_context` | Get relevant code context for a task -- entry points, related symbols, code snippets |
 | `tokensave_search` | Find symbols by name (functions, classes, types) |
 | `tokensave_node` | Get details + source code for a specific symbol |
-| `tokensave_files` | List indexed project files with filtering |
+| `tokensave_files` | List indexed project files (source and tracked artifacts) with filtering |
 | `tokensave_module_api` | Public API surface of a file or directory |
 | `tokensave_similar` | Find symbols with similar names |
 | `tokensave_annotations` | Attribute/annotation/decorator introspection -- histogram of all annotations or per-site listings with target filters |
 | `tokensave_doc` | Companion Markdown documentation for a source file -- doc content, the files it covers, and a staleness signal |
 | `tokensave_dependencies` | Package-manifest introspection across 17 ecosystems -- workspace summary, per-package lookup, license surface, version drift |
 | `tokensave_status` | Index status, statistics, tokens saved |
+
+#### Non-code artifacts
+
+`tokensave_files` covers more than source. Files whose extension is listed in
+`artifact_extensions` (`.feature`, `.json`, `.yaml`, `.yml`, `.sql`, `.toml`,
+`.proto`, `.graphql`, `.md` by default) are tracked by path so questions like
+"where are the `.feature` files for the login flow?" have a graph answer rather
+than a blocked `find` (#323). They are never parsed and contribute no symbols;
+`kind: "artifact"` and `kind: "code"` filter between the two, and analyses that
+mean "code" exclude them. An extension already handled by a language extractor
+is ignored in this list, so it cannot be used to stop a language being parsed.
 
 ### Call Graph & Impact
 
@@ -445,6 +502,7 @@ The server exposes more than 80 tools (one fewer when the optional `ast-grep` bi
 | `tokensave_coupling` | Rank files by fan-in/fan-out |
 | `tokensave_inheritance_depth` | Find the deepest inheritance hierarchies |
 | `tokensave_circular` | Detect circular file dependencies |
+| `tokensave_imports` | Module-level import dependencies, cycles, and cut simulation |
 | `tokensave_recursion` | Detect recursive/mutually-recursive call cycles |
 | `tokensave_unused_imports` | Import statements never referenced |
 | `tokensave_doc_coverage` | Public symbols missing documentation |
@@ -531,6 +589,8 @@ Four resources are exposed via `resources/list` and `resources/read`:
 ## Token Tracking
 
 tokensave measures the tokens it saves on every MCP tool call. Each tool response includes a `tokensave_metrics: before=N after=M` line showing how many raw-file tokens were avoided by that specific call.
+
+**Turning the reporting off.** The metrics line, together with a sentence in the MCP `instructions`, asks the agent to report savings to you — which means the model spends *output* tokens narrating a saving tokensave made on *input* tokens. Output tokens are the more expensive kind, so if your agent mentions tokensave on nearly every turn, that narration can offset the win (#356). Set `report_savings` to `false` in `.tokensave/config.json`, or the `TOKENSAVE_REPORT_SAVINGS` environment variable to override it per-run (any value enables it except `0`, `false`, `no`, `off`, or empty). Both the metrics line and the instruction disappear; `tokensave install` likewise stops writing the reporting rule into agent prompt files. Measurement is untouched either way — every call still lands in the savings ledger, so `tokensave gain`, `tokensave list`, `status` and `monitor` keep reporting exactly as before. The default stays `true`.
 
 ### Cost observability
 
@@ -805,6 +865,7 @@ Always compiled. The smallest binary for the most popular languages, plus Svelte
 | Minecraft Function | `.mcfunction` | `lang-mcfunction` |
 | WGSL | `.wgsl` | `lang-wgsl` |
 | HLSL | `.hlsl`, `.fx` | `lang-hlsl` |
+| Verilog / SystemVerilog | `.v`, `.vh`, `.sv`, `.svh` | `lang-systemverilog` |
 | Metal | `.metal` | `lang-metal` |
 | CUDA / HIP | `.cu`, `.cuh` | `lang-cuda` |
 | Markdown | `.md`, `.markdown` | `lang-markdown` |

@@ -8,10 +8,13 @@ use serde_json::{json, Value};
 
 use crate::errors::{Result, TokenSaveError};
 use crate::tokensave::TokenSave;
-use crate::types::{NodeKind, Visibility};
+use crate::types::{FileKind, NodeKind, Visibility};
 
 use super::super::ToolResult;
-use super::{effective_path, require_node_id, truncate_response, unique_file_paths};
+use super::{
+    effective_path, require_node_id, sibling_projects, truncate_response, unique_file_paths,
+    SIBLING_HINT,
+};
 
 /// Handles `tokensave_status` tool calls.
 pub(super) async fn handle_status(
@@ -91,6 +94,16 @@ pub(super) async fn handle_status(
         output["scope_prefix"] = json!(prefix);
     }
 
+    // Sibling repos are reachable through `graph_root` but invisible otherwise,
+    // so a session working across two checkouts concludes the symbol does not
+    // exist rather than querying the other graph (#375). Surfaced here as well
+    // as at initialize, because a sibling may have been indexed mid-session.
+    let siblings = sibling_projects(cg.project_root()).await;
+    if !siblings.is_empty() {
+        output["sibling_projects"] = json!(siblings);
+        output["sibling_projects_hint"] = json!(SIBLING_HINT);
+    }
+
     let formatted = serde_json::to_string_pretty(&output).unwrap_or_default();
     Ok(ToolResult {
         value: json!({
@@ -98,6 +111,18 @@ pub(super) async fn handle_status(
         }),
         touched_files: vec![],
     })
+}
+
+/// Describes what a listed file holds, for the `tokensave_files` rendering.
+///
+/// An artifact is labelled rather than reported as "0 symbols", which would be
+/// indistinguishable from a source file the extractor found nothing in — and
+/// would read as a parse failure rather than a file that was never parsed.
+fn describe_contents(file: &crate::types::FileRecord) -> String {
+    match file.kind {
+        FileKind::Artifact => "artifact".to_string(),
+        FileKind::Code => format!("{} symbols", file.node_count),
+    }
 }
 
 /// Handles `tokensave_files` tool calls.
@@ -127,6 +152,15 @@ pub(super) async fn handle_files(
         }
     }
 
+    // Artifacts are tracked by path and carry no symbols (#323), so a caller
+    // after source files needs a way to say so without pattern-matching
+    // extensions by hand.
+    match args.get("kind").and_then(|v| v.as_str()) {
+        Some("code") => files.retain(|f| f.kind == FileKind::Code),
+        Some("artifact") => files.retain(|f| f.kind == FileKind::Artifact),
+        _ => {}
+    }
+
     // Listing files is metadata-only — no source code is served, so no tokens saved.
     let touched_files = vec![];
 
@@ -138,7 +172,7 @@ pub(super) async fn handle_files(
     let output = if format == "flat" {
         files
             .iter()
-            .map(|f| format!("{} ({} symbols, {} bytes)", f.path, f.node_count, f.size))
+            .map(|f| format!("{} ({}, {} bytes)", f.path, describe_contents(f), f.size))
             .collect::<Vec<_>>()
             .join("\n")
     } else {
@@ -156,7 +190,7 @@ pub(super) async fn handle_files(
             groups
                 .entry(dir)
                 .or_default()
-                .push(format!("{} ({} symbols)", name, f.node_count));
+                .push(format!("{} ({})", name, describe_contents(f)));
         }
         let mut lines = Vec::new();
         lines.push(format!("{} indexed files", files.len()));
@@ -181,6 +215,7 @@ pub(super) async fn handle_files(
 const PORT_DEFAULT_KINDS: &[&str] = &[
     "function",
     "method",
+    "singleton_method",
     "class",
     "struct",
     "interface",
@@ -202,7 +237,7 @@ fn kind_compat_group(kind: &str) -> u8 {
     match kind {
         "class" | "struct" => 0,
         "function" => 1,
-        "method" => 2,
+        "method" | "singleton_method" => 2,
         "interface" | "trait" => 3,
         "enum" => 4,
         "module" => 5,
@@ -225,6 +260,7 @@ fn port_kind_has_parent(kind: &str) -> bool {
     matches!(
         kind,
         "method"
+            | "singleton_method"
             | "field"
             | "enum_variant"
             | "struct_method"
@@ -806,7 +842,10 @@ pub(super) async fn handle_simplify_scan(
 
         for node in &nodes {
             // 1. Duplication: find similar symbols elsewhere
-            if matches!(node.kind, NodeKind::Function | NodeKind::Method) {
+            if matches!(
+                node.kind,
+                NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
+            ) {
                 let similar = cg.search(&node.name, 5).await.unwrap_or_default();
                 let dupes: Vec<Value> = similar
                     .iter()
@@ -833,8 +872,10 @@ pub(super) async fn handle_simplify_scan(
             }
 
             // 2. Dead code: function/method with no incoming edges
-            if matches!(node.kind, NodeKind::Function | NodeKind::Method)
-                && node.visibility != Visibility::Pub
+            if matches!(
+                node.kind,
+                NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
+            ) && node.visibility != Visibility::Pub
                 && node.name != "main"
                 && !node.name.starts_with("test_")
             {
@@ -850,7 +891,10 @@ pub(super) async fn handle_simplify_scan(
             }
 
             // 3. Complexity: check if function exceeds threshold
-            if matches!(node.kind, NodeKind::Function | NodeKind::Method) {
+            if matches!(
+                node.kind,
+                NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
+            ) {
                 let lines = node.end_line.saturating_sub(node.start_line) as usize;
                 let fan_out = cg
                     .get_outgoing_edges(&node.id)
@@ -1091,6 +1135,7 @@ fn body_kind_preference(kind: &NodeKind) -> u8 {
     match kind {
         NodeKind::Function
         | NodeKind::Method
+        | NodeKind::SingletonMethod
         | NodeKind::StructMethod
         | NodeKind::Constructor
         | NodeKind::AbstractMethod
@@ -1294,11 +1339,38 @@ pub(super) async fn handle_read(cg: &TokenSave, args: Value) -> Result<ToolResul
     let project_root = cg.project_root().to_path_buf();
     let project_id = project_root.to_string_lossy().to_string();
     let rel_path = file.trim_start_matches('/').to_string();
-    let abs_path = if std::path::Path::new(file).is_absolute() {
+    let mut abs_path = if std::path::Path::new(file).is_absolute() {
         std::path::PathBuf::from(file)
     } else {
         project_root.join(&rel_path)
     };
+    if cg.db().is_read_only() {
+        let canonical_root =
+            project_root
+                .canonicalize()
+                .map_err(|error| TokenSaveError::Config {
+                    message: format!(
+                        "cannot canonicalize selected graph root '{}': {error}",
+                        project_root.display()
+                    ),
+                })?;
+        let canonical_path = abs_path
+            .canonicalize()
+            .map_err(|error| TokenSaveError::Config {
+                message: format!(
+                    "cannot canonicalize selected tokensave_read path '{file}': {error}"
+                ),
+            })?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(TokenSaveError::Config {
+                message: format!(
+                    "selected tokensave_read path '{file}' resolves outside selected graph root '{}'; choose a file inside that root",
+                    canonical_root.display()
+                ),
+            });
+        }
+        abs_path = canonical_path;
+    }
     let display_file = if abs_path.starts_with(&project_root) {
         abs_path
             .strip_prefix(&project_root)
@@ -1325,18 +1397,23 @@ pub(super) async fn handle_read(cg: &TokenSave, args: Value) -> Result<ToolResul
     let args_hash = read_cache::args_hash(&hash_input);
 
     let conn = cg.db().conn();
+    let cache_enabled = !cg.db().is_read_only();
 
-    if let Some(cached) = read_cache::get(
-        conn,
-        &project_id,
-        GLOBAL_SESSION,
-        &display_file,
-        mode.as_str(),
-        &args_hash,
-        mtime_ns,
-    )
-    .await?
-    {
+    let cached = if cache_enabled {
+        read_cache::get(
+            conn,
+            &project_id,
+            GLOBAL_SESSION,
+            &display_file,
+            mode.as_str(),
+            &args_hash,
+            mtime_ns,
+        )
+        .await?
+    } else {
+        None
+    };
+    if let Some(cached) = cached {
         let stub = json!({
             "unchanged": true,
             "file": display_file,
@@ -1384,19 +1461,21 @@ pub(super) async fn handle_read(cg: &TokenSave, args: Value) -> Result<ToolResul
     let token_count = read_modes::estimate_tokens(&body_text);
     let digest = read_cache::digest_bytes(body_text.as_bytes());
 
-    read_cache::put(
-        conn,
-        &project_id,
-        GLOBAL_SESSION,
-        &display_file,
-        mtime_ns,
-        mode.as_str(),
-        &args_hash,
-        &digest,
-        body_text.as_bytes(),
-        token_count,
-    )
-    .await?;
+    if cache_enabled {
+        read_cache::put(
+            conn,
+            &project_id,
+            GLOBAL_SESSION,
+            &display_file,
+            mtime_ns,
+            mode.as_str(),
+            &args_hash,
+            &digest,
+            body_text.as_bytes(),
+            token_count,
+        )
+        .await?;
+    }
 
     let payload = json!({
         "file": display_file,
@@ -1693,7 +1772,8 @@ pub(super) async fn handle_signature_search(
     }
 
     let function_nodes = cg.db().get_nodes_by_kind(NodeKind::Function).await?;
-    let method_nodes = cg.db().get_nodes_by_kind(NodeKind::Method).await?;
+    let mut method_nodes = cg.db().get_nodes_by_kind(NodeKind::Method).await?;
+    method_nodes.extend(cg.db().get_nodes_by_kind(NodeKind::SingletonMethod).await?);
 
     let mut entries: Vec<Value> = Vec::new();
     let mut touched: Vec<String> = Vec::new();

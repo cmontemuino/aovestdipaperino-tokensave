@@ -9,13 +9,13 @@
 //! The current schema version is stored in `PRAGMA user_version`, which
 //! is an atomic integer built into `SQLite`. No extra table is needed.
 
-use libsql::Connection;
+use libsql::{params, Connection};
 
 use crate::errors::{Result, TokenSaveError};
 
 /// The highest migration version defined in this file. Bump this and add a
 /// new entry to `run_migration` whenever the schema changes.
-const LATEST_VERSION: u32 = 13;
+const LATEST_VERSION: u32 = 16;
 
 pub(crate) const TRAIT_DISPATCH_TRIGGERS_SQL: &str = r"
 CREATE TRIGGER IF NOT EXISTS trait_dispatch_call_insert
@@ -153,7 +153,8 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
             distinct_operators INTEGER NOT NULL DEFAULT 0,
             distinct_operands INTEGER NOT NULL DEFAULT 0,
             total_operators INTEGER NOT NULL DEFAULT 0,
-            total_operands INTEGER NOT NULL DEFAULT 0
+            total_operands INTEGER NOT NULL DEFAULT 0,
+            search_terms TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS edges (
@@ -172,7 +173,8 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
             size INTEGER NOT NULL,
             modified_at INTEGER NOT NULL,
             indexed_at INTEGER NOT NULL,
-            node_count INTEGER NOT NULL DEFAULT 0
+            node_count INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT 'code'
         );
 
         CREATE TABLE IF NOT EXISTS unresolved_refs (
@@ -200,8 +202,9 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-            name, qualified_name, docstring, signature,
-            content='nodes', content_rowid='rowid'
+            name, qualified_name, docstring, signature, search_terms,
+            content='nodes', content_rowid='rowid',
+            tokenize='porter unicode61'
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS executable_body_fts USING fts5(
@@ -223,20 +226,20 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
             ON trait_dispatch_callers(concrete_method_id);
 
         CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
         END;
 
         CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature)
-            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
         END;
 
         CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature)
-            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
-            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
         END;
 
         CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
@@ -431,6 +434,9 @@ async fn run_migration(conn: &Connection, version: u32) -> Result<()> {
         11 => migrate_v11(conn).await,
         12 => migrate_v12(conn).await,
         13 => migrate_v13(conn).await,
+        14 => migrate_v14(conn).await,
+        15 => migrate_v15(conn).await,
+        16 => migrate_v16(conn).await,
         _ => Err(TokenSaveError::Database {
             message: format!("unknown migration version: {version}"),
             operation: "run_migration".to_string(),
@@ -479,7 +485,8 @@ async fn migrate_v1(conn: &Connection) -> Result<()> {
             size INTEGER NOT NULL,
             modified_at INTEGER NOT NULL,
             indexed_at INTEGER NOT NULL,
-            node_count INTEGER NOT NULL DEFAULT 0
+            node_count INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT 'code'
         );
 
         CREATE TABLE IF NOT EXISTS unresolved_refs (
@@ -1133,6 +1140,352 @@ async fn migrate_v13(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Migration V14: two independent one-shot repairs bundled into one version.
+//   1. Remove phantom annotation-usage-to-annotation-usage `annotates` edges.
+//   2. Add the `search_terms` column and rebuild `nodes_fts` with porter
+//      stemming so inflected prose queries match indexed identifiers.
+// The two operations touch disjoint tables (`edges` vs `nodes`/`nodes_fts`)
+// and are ordered edges-first, FTS-second; neither depends on the other.
+// ---------------------------------------------------------------------------
+
+/// One-shot data repair for the resolver bug fixed alongside this migration:
+/// `kind_compatible` used to accept `NodeKind::AnnotationUsage` and
+/// `NodeKind::Decorator` as valid targets for `EdgeKind::Annotates`, which let
+/// an annotation reference bind to a sibling usage in the same file instead of
+/// staying unresolved. The resolver now never produces `annotates` edges at
+/// all (`kind_compatible` returns `false` for the whole edge kind); the only
+/// `annotates` edges left are the ones extractors emit directly.
+///
+/// The delete targets both `annotation_usage` and `decorator` nodes:
+/// - `annotation_usage` is always a usage site, never a legitimate target of
+///   an `annotates` edge.
+/// - `decorator` is emitted at the `@foo(...)` application site (Python,
+///   TypeScript), never at the declaration it decorates, so it can never be a
+///   legitimate target either — only ever a source, including for stacked
+///   decorators (`@a @b def f`).
+///
+/// This does *not* widen to `annotation` nodes: `@Retention @interface Foo {}`
+/// is a legitimate direct edge to a `NodeKind::Annotation` node, so deleting
+/// by that target kind would remove real data. Any stale resolver-produced
+/// edges that happened to target an `annotation` node are cleared by the full
+/// reindex `TokenSave::open` already forces on any migration.
+///
+/// The second half is a retrieval graft from codebase-memory — it adds the
+/// `search_terms` column (camelCase word segments computed at write time),
+/// rebuilds `nodes_fts` with that column and the `porter unicode61` tokenizer
+/// so inflected prose queries ("ranking", "candidates") match indexed
+/// identifiers, and backfills existing rows.
+///
+/// New databases (and any file re-synced with the fixed resolver) never
+/// produce the phantom edges in the first place; that half of this migration
+/// only repairs rows already stored in databases indexed before the fix.
+///
+/// The edge repair is gated on the `edges` table actually existing — some
+/// pre-v9 migration tests seed a nodes-only schema and drive `migrate` all the
+/// way to `LATEST_VERSION`, and a real install always has the table by v1.
+async fn migrate_v14(conn: &Connection) -> Result<()> {
+    // --- Part 1: remove phantom `annotates` edges (see #326). -------------
+    let mut edge_table = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edges'",
+            (),
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to inspect edges table: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+    let has_edges = edge_table
+        .next()
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to read edges table status: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?
+        .is_some();
+    drop(edge_table);
+
+    if has_edges {
+        conn.execute(
+            "DELETE FROM edges
+             WHERE kind = 'annotates'
+               AND target IN (
+                   SELECT id FROM nodes WHERE kind IN ('annotation_usage', 'decorator')
+               )",
+            (),
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to delete phantom annotates edges: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+    }
+
+    // --- Part 2: search_terms column + porter FTS rebuild (see #316). -----
+    let cols = node_columns(conn).await?;
+    if !cols.iter().any(|c| c == "search_terms") {
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN search_terms TEXT NOT NULL DEFAULT ''")
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("v14: failed to add search_terms column: {e}"),
+                operation: "migrate_v14".to_string(),
+            })?;
+    }
+
+    // Drop the old FTS table and its triggers before the backfill so the
+    // UPDATEs below don't fire FTS sync triggers against a table that is
+    // about to be rebuilt anyway.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS nodes_fts_insert;
+         DROP TRIGGER IF EXISTS nodes_fts_delete;
+         DROP TRIGGER IF EXISTS nodes_fts_update;
+         DROP TABLE IF EXISTS nodes_fts;",
+    )
+    .await
+    .map_err(|e| TokenSaveError::Database {
+        message: format!("v14: failed to drop old FTS table: {e}"),
+        operation: "migrate_v14".to_string(),
+    })?;
+
+    // Backfill search_terms for existing nodes. Only rows that actually have
+    // camelCase-derived segments need a write; snake_case names produce an
+    // empty string, which the column already defaults to.
+    let mut rows = conn
+        .query("SELECT rowid, name, qualified_name FROM nodes", ())
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to read nodes for backfill: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+    let mut backfill: Vec<(i64, String)> = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+        message: format!("v14: failed to read backfill row: {e}"),
+        operation: "migrate_v14".to_string(),
+    })? {
+        let rowid: i64 = row.get(0).map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to read rowid: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+        let name: String = row.get(1).map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to read name: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+        let qualified_name: String = row.get(2).map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to read qualified_name: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+        let terms = crate::text::search_terms(&name, &qualified_name);
+        if !terms.is_empty() {
+            backfill.push((rowid, terms));
+        }
+    }
+    drop(rows);
+    for (rowid, terms) in backfill {
+        conn.execute(
+            "UPDATE nodes SET search_terms = ?1 WHERE rowid = ?2",
+            params![terms, rowid],
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v14: failed to backfill search_terms: {e}"),
+            operation: "migrate_v14".to_string(),
+        })?;
+    }
+
+    // Recreate the FTS table with the new column + porter stemming, its sync
+    // triggers, and rebuild the index from the content table.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            name, qualified_name, docstring, signature, search_terms,
+            content='nodes', content_rowid='rowid',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
+        END;
+
+        CREATE TRIGGER nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+        END;
+
+        CREATE TRIGGER nodes_fts_update AFTER UPDATE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
+        END;
+
+        INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');",
+    )
+    .await
+    .map_err(|e| TokenSaveError::Database {
+        message: format!("v14: failed to recreate FTS table: {e}"),
+        operation: "migrate_v14".to_string(),
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V15: restore indexes and FTS triggers lost by an interrupted
+// bulk load (#358).  `begin_bulk_load` drops all secondary indexes and FTS
+// triggers; `end_bulk_load` recreates them — but only if it runs.  If the
+// process is killed mid-`index_all` and the `.tokensave/dirty` sentinel is
+// absent, the #318 healing path in `TokenSave::open` never triggers, and
+// no earlier migration checks for or restores the missing objects.  This
+// migration recreates every index and FTS trigger with `IF NOT EXISTS`, so
+// it is instant on a healthy DB and repairs a damaged one.
+//
+// It also fixes a second root cause: `end_bulk_load` recreates the pre-v14
+// FTS triggers (without the `search_terms` column) after every `index_all`
+// on a v14 DB, silently downgrading the FTS sync.  This migration drops
+// and recreates the triggers with the v14-era bodies, and `end_bulk_load`
+// is updated in the same change to match.
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if a table named `name` exists in the current database.
+///
+/// Repair migrations use this to stay no-ops on a partial schema: a DB that
+/// predates a given table, or a minimal fixture, must not make an
+/// unconditional `CREATE INDEX … ON <table>` fail with "no such table".
+async fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("failed to probe sqlite_master for table '{name}': {e}"),
+            operation: "table_exists".to_string(),
+        })?;
+    let exists = rows
+        .next()
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read sqlite_master row for table '{name}': {e}"),
+            operation: "table_exists".to_string(),
+        })?
+        .is_some();
+    Ok(exists)
+}
+
+/// Recreates any missing secondary indexes and FTS triggers that an
+/// interrupted `begin_bulk_load` may have dropped and no prior migration
+/// restored.  Idempotent: `CREATE … IF NOT EXISTS` is a no-op when the
+/// object already exists.
+///
+/// Each object group is gated on its base table existing. On a healthy DB
+/// (the #358 repair target) every table is present and this changes nothing;
+/// the guards keep the migration a safe no-op on a partial schema — a DB
+/// migrated up from a version that predates a table, or a minimal test
+/// fixture — instead of erroring with "no such table: edges" (#359).
+async fn migrate_v15(conn: &Connection) -> Result<()> {
+    // --- Node indexes --------------------------------------------------
+    // Exactly the set `begin_bulk_load` drops and `end_bulk_load` restores —
+    // NOT the full `create_schema` set. `idx_nodes_lower_name` and
+    // `idx_nodes_parent_id` are deliberately omitted: bulk load never drops
+    // them, so they are never lost, and `idx_nodes_parent_id` would reference a
+    // `parent_id` column that only exists from v10 onward (#359).
+    if table_exists(conn, "nodes").await? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
+            CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+            CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);
+            CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);
+            CREATE INDEX IF NOT EXISTS idx_nodes_file_path_start_line ON nodes(file_path, start_line);",
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v15: failed to recreate node indexes: {e}"),
+            operation: "migrate_v15".to_string(),
+        })?;
+    }
+
+    // --- Edge indexes --------------------------------------------------
+    if table_exists(conn, "edges").await? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
+            CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
+            CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+                ON edges(source, target, kind, COALESCE(line, -1));",
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v15: failed to recreate edge indexes: {e}"),
+            operation: "migrate_v15".to_string(),
+        })?;
+    }
+
+    // --- Unresolved-ref indexes ----------------------------------------
+    if table_exists(conn, "unresolved_refs").await? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_unresolved_refs_from_node_id ON unresolved_refs(from_node_id);
+            CREATE INDEX IF NOT EXISTS idx_unresolved_refs_reference_name ON unresolved_refs(reference_name);
+            CREATE INDEX IF NOT EXISTS idx_unresolved_refs_file_path ON unresolved_refs(file_path);",
+        )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v15: failed to recreate unresolved_refs indexes: {e}"),
+            operation: "migrate_v15".to_string(),
+        })?;
+    }
+
+    // --- FTS sync triggers (v14-era bodies with `search_terms`) ---------
+    // `end_bulk_load` may have recreated the pre-v14 triggers that omit
+    // `search_terms`.  Drop and recreate to ensure the current bodies. The
+    // triggers fire on `nodes` and write to `nodes_fts`, so both must exist;
+    // by this point `migrate_v14` has already given both the `search_terms`
+    // column.
+    if table_exists(conn, "nodes").await? && table_exists(conn, "nodes_fts").await? {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS nodes_fts_insert;
+        DROP TRIGGER IF EXISTS nodes_fts_delete;
+        DROP TRIGGER IF EXISTS nodes_fts_update;
+
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
+        END;",
+    )
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v15: failed to recreate FTS triggers: {e}"),
+            operation: "migrate_v15".to_string(),
+        })?;
+    }
+
+    // --- Trait-dispatch triggers ---------------------------------------
+    // Fire on `edges` and write to `trait_dispatch_callers`; both must exist.
+    if table_exists(conn, "edges").await? && table_exists(conn, "trait_dispatch_callers").await? {
+        conn.execute_batch(TRAIT_DISPATCH_TRIGGERS_SQL)
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("v15: failed to recreate trait dispatch triggers: {e}"),
+                operation: "migrate_v15".to_string(),
+            })?;
+    }
+
+    Ok(())
+}
+
 /// Returns the column names of the `nodes` table via `PRAGMA table_info`.
 async fn node_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut rows = conn
@@ -1151,6 +1504,67 @@ async fn node_columns(conn: &Connection) -> Result<Vec<String>> {
         let name: String = row.get(1).map_err(|e| TokenSaveError::Database {
             message: format!("failed to read column name: {e}"),
             operation: "node_columns".to_string(),
+        })?;
+        cols.push(name);
+    }
+    Ok(cols)
+}
+
+// ---------------------------------------------------------------------------
+// Migration V16: file kind column
+// ---------------------------------------------------------------------------
+
+/// Adds the `kind` column to `files`, distinguishing source from artifacts.
+///
+/// Tracking non-code artifacts (#323) needs a way to tell a source file that
+/// happens to yield no symbols from a file that was never parsed at all, so
+/// analyses meaning "code" can exclude the latter. Existing rows are all
+/// source, which the column default already states.
+///
+/// `migrate_v1` creates `files` with the column, so a database migrated all
+/// the way up from v0 arrives here already holding it; the probe keeps that
+/// path a no-op rather than failing on a duplicate column.
+async fn migrate_v16(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "files").await? {
+        return Ok(());
+    }
+    if table_columns(conn, "files")
+        .await?
+        .iter()
+        .any(|c| c == "kind")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'code';")
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v16: failed to add files.kind: {e}"),
+            operation: "migrate_v16".to_string(),
+        })?;
+    Ok(())
+}
+
+/// Returns the column names of `table` via `PRAGMA table_info`.
+async fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    // PRAGMA does not accept a bound parameter for the table name, and this is
+    // only ever called with literals from this module.
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read {table} table_info: {e}"),
+            operation: "table_columns".to_string(),
+        })?;
+    let mut cols = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+        message: format!("failed to read table_info row: {e}"),
+        operation: "table_columns".to_string(),
+    })? {
+        // PRAGMA table_info columns: cid(0), name(1), type(2), ...
+        let name: String = row.get(1).map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read column name: {e}"),
+            operation: "table_columns".to_string(),
         })?;
         cols.push(name);
     }

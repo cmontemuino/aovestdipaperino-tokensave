@@ -87,6 +87,60 @@ pub struct TokenSaveConfig {
     /// switch when `tokensave install` set it up.
     #[serde(default)]
     pub auto_track: bool,
+    /// Surface per-call savings to the agent, so it can report them to the
+    /// user. Defaults to `true` (current behavior). When `false`, tool results
+    /// omit the `tokensave_metrics:` line and the MCP `instructions` drop the
+    /// sentence asking the agent to report savings — the two things that make a
+    /// model spend *output* tokens narrating what tokensave saved on *input*
+    /// (#356). The `TOKENSAVE_REPORT_SAVINGS` env var overrides this per-run.
+    /// Accounting is unaffected either way: savings are still recorded to the
+    /// global DB, so `tokensave gain` and `tokensave list` keep working.
+    #[serde(default = "default_report_savings")]
+    pub report_savings: bool,
+    /// Extensions of non-code files tracked by path so `tokensave_files` can
+    /// find them (#323). These are never parsed and contribute no symbols; the
+    /// point is that a question like "where are the `.feature` files?" has a
+    /// graph answer, since the shell alternative is blocked by the hook.
+    ///
+    /// An extension already handled by a language extractor is ignored here —
+    /// the symbol pass owns those files and records them with their symbols.
+    #[serde(default = "default_artifact_extensions")]
+    pub artifact_extensions: Vec<String>,
+}
+
+/// Serde default for [`TokenSaveConfig::artifact_extensions`].
+///
+/// Deliberately narrow: these are the formats that carry project meaning and
+/// are looked up by path — specifications, schemas, fixtures, and docs. Adding
+/// every text extension would turn `tokensave_files` into a directory listing.
+fn default_artifact_extensions() -> Vec<String> {
+    [
+        "feature", "json", "yaml", "yml", "sql", "toml", "proto", "graphql", "md",
+    ]
+    .iter()
+    .map(|ext| (*ext).to_string())
+    .collect()
+}
+
+/// Serde default for [`TokenSaveConfig::report_savings`], so configs written
+/// before #356 keep reporting savings rather than silently going quiet.
+fn default_report_savings() -> bool {
+    true
+}
+
+/// Resolves a boolean setting that an environment variable may override.
+///
+/// Presence of `var` enables the setting unless its value is explicitly falsey
+/// (`0`, `false`, `no`, `off`, or empty); absence falls back to `config_value`.
+/// This is the convention `TOKENSAVE_AUTO_TRACK` established.
+pub fn env_bool_override(var: &str, config_value: bool) -> bool {
+    match std::env::var(var) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        ),
+        Err(_) => config_value,
+    }
 }
 
 impl Default for TokenSaveConfig {
@@ -126,6 +180,8 @@ impl Default for TokenSaveConfig {
             docs_dir: default_docs_dir(),
             last_indexed_version: String::new(),
             auto_track: false,
+            report_savings: default_report_savings(),
+            artifact_extensions: default_artifact_extensions(),
         }
     }
 }
@@ -399,9 +455,51 @@ fn git_info_exclude_path(project_path: &Path) -> Option<PathBuf> {
 /// working directory.
 pub fn resolve_path(path: Option<String>) -> PathBuf {
     match path {
-        Some(p) => PathBuf::from(p),
+        Some(p) => absolutize(PathBuf::from(p)),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
+}
+
+/// Anchors a non-absolute CLI path argument to the current working directory.
+///
+/// Absolute arguments are returned untouched, so a project root a user already
+/// stored keeps its exact spelling, symlinks included.
+///
+/// On Windows a leading-slash path such as `/tmp/project` has a root but no
+/// drive, so `is_absolute` is false and it is resolved against the current
+/// drive. That matches how Windows itself resolves such a path, and it is
+/// required here: leaving it alone would hand a non-absolute path to callers
+/// that require one.
+///
+/// The result is normalized lexically rather than with `canonicalize`, which
+/// would fail on a path that does not exist yet and, on Windows, would return a
+/// `\\?\` verbatim prefix that then leaks into stored roots and user-facing
+/// messages. Normalizing by components also keeps this consistent with the
+/// absolute case, where symlinks are likewise left as the user spelled them.
+fn absolutize(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return path;
+    };
+    normalize_lexically(&cwd.join(path))
+}
+
+/// Removes `.` and resolves `..` textually, without touching the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Walks from `start` upward looking for a `.tokensave/tokensave.db`.
@@ -429,7 +527,7 @@ pub fn discover_project_root(start: &Path) -> Option<PathBuf> {
 /// create a fresh project at the target directory).
 pub fn resolve_path_with_discovery(path: Option<String>) -> PathBuf {
     if let Some(p) = path {
-        PathBuf::from(p)
+        absolutize(PathBuf::from(p))
     } else {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         discover_project_root(&cwd).unwrap_or(cwd)
@@ -615,8 +713,8 @@ pub fn load_query_ignore(project_root: &Path) -> QueryIgnore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        is_excluded, is_excluded_dir, is_ignored_by_git, is_included, load_query_ignore,
-        QueryIgnore, TokenSaveConfig,
+        env_bool_override, is_excluded, is_excluded_dir, is_ignored_by_git, is_included,
+        load_query_ignore, QueryIgnore, TokenSaveConfig,
     };
     use std::fs;
     use std::process::Command;
@@ -797,5 +895,39 @@ mod tests {
         assert!(qi.is_ignored("src/generated/x.rs"));
         assert!(qi.is_ignored("tests/foo.rs"));
         assert!(!qi.is_ignored("src/main.rs"));
+    }
+
+    #[test]
+    fn report_savings_defaults_to_on() {
+        // #356 asked for an opt-out, not a change of default.
+        assert!(TokenSaveConfig::default().report_savings);
+    }
+
+    #[test]
+    fn configs_written_before_the_field_existed_keep_reporting() {
+        // Serde must not read a missing field as `false` and silently go quiet
+        // on every project initialized before #356.
+        let json = r#"{"version":1,"root_dir":"/x","exclude":[],"max_file_size":1000,
+                       "extract_docstrings":true,"track_call_sites":true}"#;
+        let config: TokenSaveConfig = serde_json::from_str(json).unwrap();
+        assert!(config.report_savings);
+    }
+
+    #[test]
+    fn report_savings_round_trips_when_disabled() {
+        let config = TokenSaveConfig {
+            report_savings: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TokenSaveConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.report_savings);
+    }
+
+    #[test]
+    fn env_override_respects_falsey_spellings() {
+        // Absent → the config value wins, in both directions.
+        assert!(env_bool_override("TOKENSAVE_UNSET_TEST_VAR_XYZ", true));
+        assert!(!env_bool_override("TOKENSAVE_UNSET_TEST_VAR_XYZ", false));
     }
 }

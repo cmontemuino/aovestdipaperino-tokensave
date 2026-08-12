@@ -466,6 +466,650 @@ async fn test_resolve_all_dotted_method_call() {
     );
 }
 
+#[tokio::test]
+async fn test_ruby_receiver_calls_do_not_fall_back_to_bare_names() {
+    let (_dir, db) = setup_db_with_nodes().await;
+    let mut ruby_helper = db
+        .get_all_nodes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "helper")
+        .unwrap();
+    ruby_helper.id = generate_node_id("app/helper.rb", &NodeKind::Method, "helper", 1);
+    ruby_helper.kind = NodeKind::Method;
+    ruby_helper.qualified_name = "app/helper.rb::Helper::helper".to_string();
+    ruby_helper.file_path = "app/helper.rb".to_string();
+    ruby_helper.signature = Some("def helper".to_string());
+    db.insert_node(&ruby_helper).await.unwrap();
+
+    let all_nodes = db.get_all_nodes().await.unwrap();
+    let resolver = ReferenceResolver::from_nodes(&db, &all_nodes);
+    let from_node_id = generate_node_id("app/service.rb", &NodeKind::Method, "run", 1);
+
+    let names = [
+        "worker.helper",
+        "self.helper",
+        "Worker.helper",
+        "Namespace::Worker.helper",
+        "worker&.helper",
+        "worker::helper",
+        "helper",
+    ];
+    let refs: Vec<_> = names
+        .iter()
+        .map(|name| UnresolvedRef {
+            from_node_id: from_node_id.clone(),
+            reference_name: (*name).to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 3,
+            column: 4,
+            file_path: "app/service.rb".to_string(),
+        })
+        .collect();
+
+    let result = resolver.resolve_all(&refs);
+    assert_eq!(
+        result.resolved_count, 1,
+        "only the bare Ruby call should resolve"
+    );
+    assert_eq!(result.resolved[0].original.reference_name, "helper");
+
+    let unresolved_names: Vec<_> = result
+        .unresolved
+        .iter()
+        .map(|reference| reference.reference_name.as_str())
+        .collect();
+    for receiver_call in &names[..names.len() - 1] {
+        assert!(
+            unresolved_names.contains(receiver_call),
+            "receiver-qualified Ruby call {receiver_call:?} must remain unresolved"
+        );
+    }
+}
+
+fn ruby_node(
+    file_path: &str,
+    kind: NodeKind,
+    name: &str,
+    line: u32,
+    signature: &str,
+    parent: Option<&Node>,
+) -> Node {
+    let qualified_name = parent.map_or_else(
+        || format!("{file_path}::{name}"),
+        |owner| format!("{}::{name}", owner.qualified_name),
+    );
+    Node {
+        id: generate_node_id(file_path, &kind, name, line),
+        kind,
+        name: name.to_string(),
+        qualified_name,
+        file_path: file_path.to_string(),
+        start_line: line,
+        attrs_start_line: line,
+        end_line: line,
+        start_column: 0,
+        end_column: 0,
+        signature: Some(signature.to_string()),
+        docstring: None,
+        visibility: Visibility::Pub,
+        is_async: false,
+        branches: 0,
+        loops: 0,
+        returns: 0,
+        max_nesting: 0,
+        unsafe_blocks: 0,
+        unchecked_calls: 0,
+        assertions: 0,
+        cognitive_complexity: 0,
+        distinct_operators: 0,
+        distinct_operands: 0,
+        total_operators: 0,
+        total_operands: 0,
+        updated_at: 0,
+        parent_id: parent.map(|owner| owner.id.clone()),
+    }
+}
+
+#[tokio::test]
+async fn test_ruby_receiver_calls_resolve_only_with_explicit_singleton_evidence() {
+    let (_dir, db) = setup_db_with_nodes().await;
+
+    let service = ruby_node(
+        "app/services/report.rb",
+        NodeKind::Class,
+        "Report",
+        1,
+        "class Report",
+        None,
+    );
+    let singleton_caller = ruby_node(
+        "app/services/report.rb",
+        NodeKind::SingletonMethod,
+        "run",
+        2,
+        "def self.run",
+        Some(&service),
+    );
+    let instance_caller = ruby_node(
+        "app/services/report.rb",
+        NodeKind::Method,
+        "instance_run",
+        3,
+        "def instance_run",
+        Some(&service),
+    );
+    let singleton_target = ruby_node(
+        "app/services/report.rb",
+        NodeKind::SingletonMethod,
+        "publish",
+        4,
+        "def self.publish; end",
+        Some(&service),
+    );
+    let same_named_instance_target = ruby_node(
+        "app/services/report.rb",
+        NodeKind::Method,
+        "publish",
+        5,
+        "def publish",
+        Some(&service),
+    );
+    let instance_target = ruby_node(
+        "app/services/report.rb",
+        NodeKind::Method,
+        "archive",
+        6,
+        "def archive",
+        Some(&service),
+    );
+
+    let capture = ruby_node(
+        "app/services/payments/capture.rb",
+        NodeKind::Class,
+        "Payments::Capture",
+        1,
+        "class Payments::Capture",
+        None,
+    );
+    let capture_call = ruby_node(
+        "app/services/payments/capture.rb",
+        NodeKind::SingletonMethod,
+        "call",
+        2,
+        "def self.call(value)",
+        Some(&capture),
+    );
+
+    let instance_only = ruby_node(
+        "app/models/instance_only.rb",
+        NodeKind::Class,
+        "InstanceOnly",
+        1,
+        "class InstanceOnly",
+        None,
+    );
+    let instance_perform = ruby_node(
+        "app/models/instance_only.rb",
+        NodeKind::Method,
+        "perform",
+        2,
+        "def perform",
+        Some(&instance_only),
+    );
+
+    let ledger = ruby_node(
+        "app/models/ledger.rb",
+        NodeKind::Class,
+        "Ledger",
+        1,
+        "class Ledger",
+        None,
+    );
+    let singleton_class_total = ruby_node(
+        "app/models/ledger.rb",
+        NodeKind::SingletonMethod,
+        "total",
+        3,
+        "def total",
+        Some(&ledger),
+    );
+    let unrelated = ruby_node(
+        "app/services/unrelated.rb",
+        NodeKind::Class,
+        "Unrelated",
+        1,
+        "class Unrelated",
+        None,
+    );
+    let unrelated_publish = ruby_node(
+        "app/services/unrelated.rb",
+        NodeKind::SingletonMethod,
+        "publish",
+        2,
+        "def self.publish",
+        Some(&unrelated),
+    );
+    let announcer = ruby_node(
+        "app/services/announcer.rb",
+        NodeKind::Module,
+        "Announcer",
+        1,
+        "module Announcer",
+        None,
+    );
+    let announcer_publish = ruby_node(
+        "app/services/announcer.rb",
+        NodeKind::SingletonMethod,
+        "publish",
+        2,
+        "def self.publish",
+        Some(&announcer),
+    );
+
+    for node in [
+        &service,
+        &singleton_caller,
+        &instance_caller,
+        &singleton_target,
+        &same_named_instance_target,
+        &instance_target,
+        &capture,
+        &capture_call,
+        &instance_only,
+        &instance_perform,
+        &ledger,
+        &singleton_class_total,
+        &unrelated,
+        &unrelated_publish,
+        &announcer,
+        &announcer_publish,
+    ] {
+        db.insert_node(node).await.unwrap();
+    }
+
+    let all_nodes = db.get_all_nodes().await.unwrap();
+    let resolver = ReferenceResolver::from_nodes(&db, &all_nodes);
+    let reference = |from_node_id: &str, name: &str| UnresolvedRef {
+        from_node_id: from_node_id.to_string(),
+        reference_name: name.to_string(),
+        reference_kind: EdgeKind::Calls,
+        line: 10,
+        column: 4,
+        file_path: "app/services/report.rb".to_string(),
+    };
+
+    for name in [
+        "Payments::Capture.call",
+        "Payments::Capture&.call",
+        "Payments::Capture::call",
+    ] {
+        let resolved = resolver
+            .resolve_one(&reference(&singleton_caller.id, name))
+            .unwrap();
+        assert_eq!(resolved.target_node_id, capture_call.id);
+        assert_eq!(resolved.resolved_by, "ruby-constant-receiver");
+        assert_eq!(resolved.confidence, 0.95);
+    }
+
+    let self_call = resolver
+        .resolve_one(&reference(&singleton_caller.id, "self.publish"))
+        .unwrap();
+    assert_eq!(self_call.target_node_id, singleton_target.id);
+    assert_eq!(self_call.resolved_by, "ruby-self-receiver");
+
+    let class_body_self_call = resolver
+        .resolve_one(&reference(&service.id, "self.publish"))
+        .unwrap();
+    assert_eq!(class_body_self_call.target_node_id, singleton_target.id);
+
+    let module_body_self_call = resolver
+        .resolve_one(&reference(&announcer.id, "self.publish"))
+        .unwrap();
+    assert_eq!(module_body_self_call.target_node_id, announcer_publish.id);
+
+    let singleton_class_call = resolver
+        .resolve_one(&reference(&singleton_caller.id, "Ledger.total"))
+        .unwrap();
+    assert_eq!(
+        singleton_class_call.target_node_id,
+        singleton_class_total.id
+    );
+    assert_eq!(singleton_class_call.resolved_by, "ruby-constant-receiver");
+
+    for (caller, name) in [
+        (&singleton_caller.id, "InstanceOnly.perform"),
+        (&instance_caller.id, "self.publish"),
+        (&singleton_caller.id, "self.archive"),
+        (&singleton_caller.id, "worker.publish"),
+        (&singleton_caller.id, "@worker.publish"),
+        (&singleton_caller.id, "account.owner.publish"),
+        (&singleton_caller.id, "\"Report\".publish"),
+        (&singleton_caller.id, "Unknown.publish"),
+    ] {
+        assert!(
+            resolver.resolve_one(&reference(caller, name)).is_none(),
+            "unsupported Ruby receiver call {name:?} must remain unresolved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_ruby_receiver_calls_reject_ambiguous_owners_and_targets() {
+    let (_dir, db) = setup_db_with_nodes().await;
+
+    let top_user = ruby_node(
+        "app/models/user.rb",
+        NodeKind::Class,
+        "User",
+        1,
+        "class User",
+        None,
+    );
+    let top_find = ruby_node(
+        "app/models/user.rb",
+        NodeKind::SingletonMethod,
+        "find",
+        2,
+        "def self.find",
+        Some(&top_user),
+    );
+    let admin_user = ruby_node(
+        "app/models/admin/user.rb",
+        NodeKind::Class,
+        "Admin::User",
+        1,
+        "class Admin::User",
+        None,
+    );
+    let capture_a = ruby_node(
+        "app/services/capture_a.rb",
+        NodeKind::Class,
+        "Payments::Capture",
+        1,
+        "class Payments::Capture",
+        None,
+    );
+    let call_a = ruby_node(
+        "app/services/capture_a.rb",
+        NodeKind::SingletonMethod,
+        "call",
+        2,
+        "def self.call",
+        Some(&capture_a),
+    );
+    let capture_b = ruby_node(
+        "app/services/capture_b.rb",
+        NodeKind::Class,
+        "Payments::Capture",
+        1,
+        "class Payments::Capture",
+        None,
+    );
+    let call_b = ruby_node(
+        "app/services/capture_b.rb",
+        NodeKind::SingletonMethod,
+        "call",
+        2,
+        "def self.call",
+        Some(&capture_b),
+    );
+
+    for node in [
+        &top_user,
+        &top_find,
+        &admin_user,
+        &capture_a,
+        &call_a,
+        &capture_b,
+        &call_b,
+    ] {
+        db.insert_node(node).await.unwrap();
+    }
+
+    let all_nodes = db.get_all_nodes().await.unwrap();
+    let resolver = ReferenceResolver::from_nodes(&db, &all_nodes);
+    let reference = |name: &str| UnresolvedRef {
+        from_node_id: "caller".to_string(),
+        reference_name: name.to_string(),
+        reference_kind: EdgeKind::Calls,
+        line: 1,
+        column: 0,
+        file_path: "app/services/caller.rb".to_string(),
+    };
+
+    assert!(resolver.resolve_one(&reference("User.find")).is_none());
+    let absolute = resolver.resolve_one(&reference("::User.find")).unwrap();
+    assert_eq!(absolute.target_node_id, top_find.id);
+    assert!(resolver
+        .resolve_one(&reference("Payments::Capture.call"))
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_ruby_receiver_calls_respect_lexical_constant_shadowing() {
+    let (_dir, db) = setup_db_with_nodes().await;
+
+    let service = ruby_node(
+        "app/service.rb",
+        NodeKind::Class,
+        "Service",
+        1,
+        "class Service",
+        None,
+    );
+    let top_run = ruby_node(
+        "app/service.rb",
+        NodeKind::SingletonMethod,
+        "run",
+        2,
+        "def self.run",
+        Some(&service),
+    );
+    let admin = ruby_node(
+        "app/admin.rb",
+        NodeKind::Module,
+        "Admin",
+        1,
+        "module Admin",
+        None,
+    );
+    let shadow = ruby_node(
+        "app/admin.rb",
+        NodeKind::Const,
+        "Service",
+        2,
+        "Service = Object.new",
+        Some(&admin),
+    );
+    let payments = ruby_node(
+        "app/payments/capture.rb",
+        NodeKind::Module,
+        "Payments",
+        1,
+        "module Payments",
+        None,
+    );
+    let capture = ruby_node(
+        "app/payments/capture.rb",
+        NodeKind::Class,
+        "Capture",
+        2,
+        "class Capture",
+        Some(&payments),
+    );
+    let capture_call = ruby_node(
+        "app/payments/capture.rb",
+        NodeKind::SingletonMethod,
+        "call",
+        3,
+        "def self.call",
+        Some(&capture),
+    );
+    let payments_shadow = ruby_node(
+        "app/admin.rb",
+        NodeKind::Const,
+        "Payments",
+        3,
+        "Payments = Object.new",
+        Some(&admin),
+    );
+
+    for node in [
+        &service,
+        &top_run,
+        &admin,
+        &shadow,
+        &payments,
+        &capture,
+        &capture_call,
+        &payments_shadow,
+    ] {
+        db.insert_node(node).await.unwrap();
+    }
+
+    let all_nodes = db.get_all_nodes().await.unwrap();
+    let resolver = ReferenceResolver::from_nodes(&db, &all_nodes);
+    let reference = |name: &str| UnresolvedRef {
+        from_node_id: admin.id.clone(),
+        reference_name: name.to_string(),
+        reference_kind: EdgeKind::Calls,
+        line: 3,
+        column: 2,
+        file_path: admin.file_path.clone(),
+    };
+
+    assert!(resolver.resolve_one(&reference("Service.run")).is_none());
+    assert!(resolver
+        .resolve_one(&reference("Payments::Capture.call"))
+        .is_none());
+    let absolute = resolver.resolve_one(&reference("::Service.run")).unwrap();
+    assert_eq!(absolute.target_node_id, top_run.id);
+    let absolute_qualified = resolver
+        .resolve_one(&reference("::Payments::Capture.call"))
+        .unwrap();
+    assert_eq!(absolute_qualified.target_node_id, capture_call.id);
+}
+
+#[tokio::test]
+async fn test_ruby_receiver_calls_choose_the_innermost_lexical_constant() {
+    let (_dir, db) = setup_db_with_nodes().await;
+
+    let top_service = ruby_node(
+        "app/service.rb",
+        NodeKind::Class,
+        "Service",
+        1,
+        "class Service",
+        None,
+    );
+    let top_run = ruby_node(
+        "app/service.rb",
+        NodeKind::SingletonMethod,
+        "run",
+        2,
+        "def self.run",
+        Some(&top_service),
+    );
+    let admin = ruby_node(
+        "app/admin.rb",
+        NodeKind::Module,
+        "Admin",
+        1,
+        "module Admin",
+        None,
+    );
+    let lexical_service = ruby_node(
+        "app/admin.rb",
+        NodeKind::Class,
+        "Service",
+        2,
+        "class Service",
+        Some(&admin),
+    );
+    let lexical_run = ruby_node(
+        "app/admin.rb",
+        NodeKind::SingletonMethod,
+        "run",
+        3,
+        "def self.run",
+        Some(&lexical_service),
+    );
+    let runner = ruby_node(
+        "app/admin.rb",
+        NodeKind::Class,
+        "Runner",
+        4,
+        "class Runner",
+        Some(&admin),
+    );
+    let caller = ruby_node(
+        "app/admin.rb",
+        NodeKind::SingletonMethod,
+        "execute",
+        5,
+        "def self.execute",
+        Some(&runner),
+    );
+    let other = ruby_node(
+        "app/other.rb",
+        NodeKind::Module,
+        "Other",
+        1,
+        "module Other",
+        None,
+    );
+    let unrelated_job = ruby_node(
+        "app/other.rb",
+        NodeKind::Class,
+        "Job",
+        2,
+        "class Job",
+        Some(&other),
+    );
+    let unrelated_run = ruby_node(
+        "app/other.rb",
+        NodeKind::SingletonMethod,
+        "run",
+        3,
+        "def self.run",
+        Some(&unrelated_job),
+    );
+
+    for node in [
+        &top_service,
+        &top_run,
+        &admin,
+        &lexical_service,
+        &lexical_run,
+        &runner,
+        &caller,
+        &other,
+        &unrelated_job,
+        &unrelated_run,
+    ] {
+        db.insert_node(node).await.unwrap();
+    }
+
+    let all_nodes = db.get_all_nodes().await.unwrap();
+    let resolver = ReferenceResolver::from_nodes(&db, &all_nodes);
+    let reference = |name: &str| UnresolvedRef {
+        from_node_id: caller.id.clone(),
+        reference_name: name.to_string(),
+        reference_kind: EdgeKind::Calls,
+        line: 6,
+        column: 4,
+        file_path: caller.file_path.clone(),
+    };
+
+    let lexical = resolver.resolve_one(&reference("Service.run")).unwrap();
+    assert_eq!(lexical.target_node_id, lexical_run.id);
+    let absolute = resolver.resolve_one(&reference("::Service.run")).unwrap();
+    assert_eq!(absolute.target_node_id, top_run.id);
+    assert!(resolver.resolve_one(&reference("Job.run")).is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Ruby mixins: `kind_compatible` resolves a Ruby `Implements` ref
 // exclusively to a `NodeKind::Module` target, and only when the ref comes
@@ -719,6 +1363,154 @@ async fn test_ruby_extends_resolves_to_class() {
         "a Ruby Extends ref should still resolve to a Class target"
     );
     assert_eq!(result.unwrap().target_node_id, class_node.id);
+}
+
+// ---------------------------------------------------------------------------
+// The resolver never produces `annotates` edges: `kind_compatible` returns
+// `false` for every target kind under `EdgeKind::Annotates`. Extractors emit
+// the attachment edge (usage -> decorated item) directly; that is the only
+// relation `annotates` names to any consumer, so the resolver has nothing to
+// add. These tests pin that an `Annotates` ref stays unresolved against
+// every kind of candidate that could otherwise look like a match: a sibling
+// usage (self- or cross-node), a real `Annotation` declaration, and a
+// `Decorator` node (which is itself a usage-site node, not a declaration —
+// emitted at the `@foo(...)` application site, not the `def`/`class` it
+// decorates).
+// ---------------------------------------------------------------------------
+
+/// Two `@override` usages in one file, each with an `Annotates` ref named
+/// "override": neither may resolve to the other (self-edge) or to its
+/// sibling (cross-node phantom).
+#[tokio::test]
+async fn test_annotation_ref_does_not_bind_to_sibling_usage() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let (db, _) = Database::initialize(&dir.path().join("test.db"))
+        .await
+        .expect("failed to init db");
+
+    let usage_a = variant_node(
+        "au:override:a",
+        NodeKind::AnnotationUsage,
+        "override",
+        "lib/a.dart::override",
+        "lib/a.dart",
+    );
+    let usage_b = variant_node(
+        "au:override:b",
+        NodeKind::AnnotationUsage,
+        "override",
+        "lib/a.dart::override",
+        "lib/a.dart",
+    );
+
+    let nodes = vec![usage_a.clone(), usage_b.clone()];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    let uref_a = UnresolvedRef {
+        from_node_id: usage_a.id.clone(),
+        reference_name: "override".to_string(),
+        reference_kind: EdgeKind::Annotates,
+        line: 1,
+        column: 1,
+        file_path: "lib/a.dart".to_string(),
+    };
+    let uref_b = UnresolvedRef {
+        from_node_id: usage_b.id.clone(),
+        reference_name: "override".to_string(),
+        reference_kind: EdgeKind::Annotates,
+        line: 5,
+        column: 1,
+        file_path: "lib/a.dart".to_string(),
+    };
+
+    assert!(
+        resolver.resolve_one(&uref_a).is_none(),
+        "an Annotates ref must not resolve to a sibling AnnotationUsage (self or cross-node)"
+    );
+    assert!(
+        resolver.resolve_one(&uref_b).is_none(),
+        "an Annotates ref must not resolve to a sibling AnnotationUsage (self or cross-node)"
+    );
+}
+
+/// An `Annotates` ref must not resolve to a real `Annotation` declaration
+/// (e.g. Java `@interface`) either: the resolver produces no `annotates`
+/// edges at all, since the extractor already emits the attachment edge
+/// directly and no consumer reads a resolver-produced usage -> declaration
+/// edge under this kind as attachment.
+#[tokio::test]
+async fn test_annotation_ref_does_not_bind_to_declaration() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let (db, _) = Database::initialize(&dir.path().join("test.db"))
+        .await
+        .expect("failed to init db");
+
+    let decl_node = variant_node(
+        "an:JsonSerializable",
+        NodeKind::Annotation,
+        "JsonSerializable",
+        "lib/model.dart::JsonSerializable",
+        "lib/model.dart",
+    );
+    let usage_node = variant_node(
+        "au:JsonSerializable",
+        NodeKind::AnnotationUsage,
+        "JsonSerializable",
+        "lib/a.dart::JsonSerializable",
+        "lib/a.dart",
+    );
+
+    let nodes = vec![decl_node, usage_node];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    let uref = UnresolvedRef {
+        from_node_id: "au:JsonSerializable".to_string(),
+        reference_name: "JsonSerializable".to_string(),
+        reference_kind: EdgeKind::Annotates,
+        line: 1,
+        column: 1,
+        file_path: "lib/a.dart".to_string(),
+    };
+
+    assert!(
+        resolver.resolve_one(&uref).is_none(),
+        "an Annotates ref must not resolve to an Annotation declaration"
+    );
+}
+
+/// `NodeKind::Decorator` is a usage-site node (emitted at the `@foo(...)`
+/// application site, not the declaration it decorates), so it must not be a
+/// valid `Annotates` target either.
+#[tokio::test]
+async fn test_annotation_ref_does_not_bind_to_decorator() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let (db, _) = Database::initialize(&dir.path().join("test.db"))
+        .await
+        .expect("failed to init db");
+
+    let decorator_node = variant_node(
+        "dec:retry",
+        NodeKind::Decorator,
+        "retry",
+        "lib/decorators.py::retry",
+        "lib/decorators.py",
+    );
+
+    let resolver = ReferenceResolver::from_nodes(&db, std::slice::from_ref(&decorator_node));
+
+    let uref = UnresolvedRef {
+        from_node_id: "fn:call_api".to_string(),
+        reference_name: "retry".to_string(),
+        reference_kind: EdgeKind::Annotates,
+        line: 1,
+        column: 1,
+        file_path: "lib/api.py".to_string(),
+    };
+
+    assert!(
+        resolver.resolve_one(&uref).is_none(),
+        "an Annotates ref must not resolve to a Decorator usage node"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ pub(crate) fn kind_tier(kind: &NodeKind) -> u8 {
         // symbol name.
         NodeKind::Function
         | NodeKind::Method
+        | NodeKind::SingletonMethod
         | NodeKind::StructMethod
         | NodeKind::Constructor
         | NodeKind::AbstractMethod
@@ -105,6 +106,7 @@ pub(crate) fn kind_rank_bonus(kind: &NodeKind) -> f64 {
         // Callable definitions
         NodeKind::Function
         | NodeKind::Method
+        | NodeKind::SingletonMethod
         | NodeKind::StructMethod
         | NodeKind::Constructor
         | NodeKind::AbstractMethod
@@ -257,6 +259,13 @@ pub(crate) fn normalize_lookup_path(project_root: &std::path::Path, raw: &str) -
         }
     }
     forward
+}
+
+/// Single-quotes a value so it can be embedded safely in a suggested shell
+/// command (for example a branch name in `tokensave branch add '<name>'`).
+/// Any embedded single quote is escaped as `'\''`.
+pub(crate) fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// True when the user-supplied query matches either the node's short `name`

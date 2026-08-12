@@ -124,13 +124,21 @@ pub(super) async fn handle_search(
                 "kind": r.node.kind.as_str(),
                 "file": r.node.file_path,
                 "line": super::display_line(r.node.start_line),
-                "signature": r.node.signature,
+                "signature": r.node.signature.as_deref().map(crate::context::compact_signature),
                 "score": r.score,
             })
         })
         .collect();
 
-    let output = serde_json::to_string_pretty(&items).unwrap_or_default();
+    // An empty array is where a cross-repo session gives up and concludes the
+    // symbol does not exist, so this is the one place the sibling graphs are
+    // worth naming (#375). Shape only changes when there is nothing to return.
+    let payload = match super::sibling_note(items.is_empty(), cg.project_root()).await {
+        Some(note) => note,
+        None => Value::Array(items),
+    };
+
+    let output = serde_json::to_string_pretty(&payload).unwrap_or_default();
     Ok(ToolResult {
         value: json!({
             "content": [{ "type": "text", "text": truncate_response(&output) }]
@@ -443,6 +451,24 @@ pub(super) async fn handle_context(
         );
     }
 
+    // See the matching note in `handle_search` (#375): a context request that
+    // found nothing is exactly when a sibling graph is worth naming.
+    if context.subgraph.nodes.is_empty() {
+        let siblings = super::sibling_projects(cg.project_root()).await;
+        if !siblings.is_empty() {
+            let _ = write!(
+                output,
+                "\n### Other initialized projects\n{}\n\n{}\n",
+                siblings
+                    .iter()
+                    .map(|path| format!("- `{path}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                super::SIBLING_HINT,
+            );
+        }
+    }
+
     Ok(ToolResult {
         value: json!({
             "content": [{ "type": "text", "text": truncate_response(&output) }]
@@ -635,7 +661,7 @@ pub(super) async fn handle_find_exact_symbol(
                 "kind": n.kind.as_str(),
                 "file": n.file_path,
                 "line": super::display_line(n.start_line),
-                "signature": n.signature,
+                "signature": n.signature.as_deref().map(crate::context::compact_signature),
             })
         })
         .collect();
@@ -834,7 +860,7 @@ pub(super) async fn handle_node(cg: &TokenSave, args: Value) -> Result<ToolResul
                 "file": n.file_path,
                 "start_line": super::display_line(n.start_line),
                 "end_line": super::display_line(n.end_line),
-                "signature": n.signature,
+                "signature": n.signature.as_deref().map(crate::context::compact_signature),
                 "docstring": n.docstring,
                 "visibility": n.visibility.as_str(),
                 "is_async": n.is_async,
@@ -939,7 +965,7 @@ pub(super) async fn handle_similar(cg: &TokenSave, args: Value) -> Result<ToolRe
                 "kind": r.node.kind.as_str(),
                 "file": r.node.file_path,
                 "line": super::display_line(r.node.start_line),
-                "signature": r.node.signature,
+                "signature": r.node.signature.as_deref().map(crate::context::compact_signature),
                 "score": r.score,
             })
         })
@@ -1188,7 +1214,7 @@ pub(super) async fn handle_signature(cg: &TokenSave, args: Value) -> Result<Tool
             "kind": n.kind.as_str(),
             "visibility": n.visibility.as_str(),
             "is_async": n.is_async,
-            "signature": n.signature,
+            "signature": n.signature.as_deref().map(crate::context::compact_signature),
             "docstring": n.docstring,
             "file": n.file_path,
             "start_line": super::display_line(n.start_line),
@@ -1513,7 +1539,12 @@ pub(super) async fn handle_implementations(
             .await?;
         let method_nodes: Vec<&crate::types::Node> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+            .filter(|n| {
+                matches!(
+                    n.kind,
+                    NodeKind::Function | NodeKind::Method | NodeKind::SingletonMethod
+                )
+            })
             .filter(|n| scope_prefix.is_none_or(|p| n.file_path.starts_with(p)))
             .take(limit)
             .collect();
@@ -1541,7 +1572,7 @@ pub(super) async fn handle_implementations(
                 "file": n.file_path,
                 "line": super::display_line(n.start_line),
                 "end_line": super::display_line(n.end_line),
-                "signature": n.signature,
+                "signature": n.signature.as_deref().map(crate::context::compact_signature),
                 "body": body,
             }));
         }
@@ -1569,7 +1600,10 @@ async fn collect_method_bodies(
     let children = cg.db().get_children_of(&impl_node.id).await?;
     let mut out: Vec<Value> = Vec::new();
     for child in children {
-        if !matches!(child.kind, NodeKind::Method | NodeKind::Function) {
+        if !matches!(
+            child.kind,
+            NodeKind::Method | NodeKind::SingletonMethod | NodeKind::Function
+        ) {
             continue;
         }
         let abs_path = project_root.join(&child.file_path);

@@ -1,8 +1,103 @@
 //! Git branch resolution utilities for multi-branch indexing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::branch_meta::BranchMeta;
+
+/// Returns the path of a database's `-wal` sidecar file.
+fn wal_sidecar(db_path: &Path) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push("-wal");
+    PathBuf::from(os)
+}
+
+/// File size in bytes, or 0 when the file does not exist.
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
+/// Snapshots `parent_db` into `new_db_path` via `VACUUM INTO`, which writes a
+/// consistent copy under the connection's read snapshot even while another
+/// connection is committing. Fails if the parent is not a readable `SQLite`
+/// file; `new_db_path` must not exist.
+async fn vacuum_into(parent_db: &Path, new_db_path: &Path) -> std::result::Result<(), String> {
+    let db = libsql::Builder::new_local(parent_db)
+        .build()
+        .await
+        .map_err(|e| e.to_string())?;
+    let conn = db.connect().map_err(|e| e.to_string())?;
+    // A lossy conversion would make VACUUM INTO "succeed" at a mangled
+    // replacement-character path; bail to the file-copy fallback instead,
+    // which handles non-UTF-8 paths losslessly.
+    let dest = new_db_path
+        .to_str()
+        .ok_or_else(|| "non-UTF-8 destination path".to_string())?
+        .to_owned();
+    conn.execute("VACUUM INTO ?1", [dest])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Copies `parent_db` to `new_db_path` without dropping data that sits in the
+/// parent's uncheckpointed WAL (#292).
+///
+/// A long-lived MCP server keeps the parent DB open in WAL mode, so committed
+/// rows can live only in the `-wal` sidecar for a long time. A bare
+/// `fs::copy` of the `.db` then produces a truncated snapshot — nodes that
+/// happen to be checkpointed still answer queries while e.g. the `files`
+/// table comes up empty. Two layers close that hole:
+///
+/// 1. `VACUUM INTO` writes a transactionally consistent snapshot of the
+///    parent (main file + WAL contents), correct even while a concurrent
+///    connection is writing. It targets a unique temp file that is renamed
+///    over the destination — the same atomic-publish idiom as
+///    `save_branch_meta` — so two trackers racing on the same branch each
+///    produce a complete DB and the loser atomically replaces the winner's,
+///    and a stale destination left by an interrupted earlier attempt is
+///    replaced rather than diverting to the fallback below.
+/// 2. If the snapshot fails (the parent is not a readable `SQLite` file, or
+///    an exotic locking failure), fall back to a best-effort
+///    `wal_checkpoint(TRUNCATE)` followed by a plain file copy, bringing the
+///    `-wal` sidecar along if the checkpoint could not empty it so `SQLite`
+///    recovers it on first open of the new DB. This path is not
+///    race-free against an active writer — the snapshot layer above is.
+pub async fn copy_branch_db(parent_db: &Path, new_db_path: &Path) -> crate::errors::Result<()> {
+    let file_name = new_db_path.file_name().map_or_else(
+        || "branch.db".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp =
+        new_db_path.with_file_name(format!(".{file_name}.{}.{nanos}.tmp", std::process::id()));
+    if vacuum_into(parent_db, &tmp).await.is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, new_db_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&tmp);
+
+    let parent_wal = wal_sidecar(parent_db);
+    if file_len(&parent_wal) > 0 {
+        // Errors are deliberately ignored: the non-empty-WAL check below
+        // catches every failure mode uniformly by falling back to a sidecar
+        // copy.
+        if let Ok(db) = libsql::Builder::new_local(parent_db).build().await {
+            if let Ok(conn) = db.connect() {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").await;
+            }
+        }
+    }
+    std::fs::copy(parent_db, new_db_path)?;
+    if file_len(&parent_wal) > 0 {
+        std::fs::copy(&parent_wal, wal_sidecar(new_db_path))?;
+    }
+    Ok(())
+}
 
 /// Resolves the current branch name using `gix`. Falls back to
 /// `git symbolic-ref HEAD` for worktrees when gix cannot resolve HEAD
@@ -182,6 +277,36 @@ pub fn find_nearest_tracked_ancestor(
     best.map(|(name, _)| name)
 }
 
+/// Returns the `branches/<name>.db` relative `db_file` to use for `branch`,
+/// guaranteed not to collide with a *different* branch already recorded in
+/// `meta`.
+///
+/// `sanitize_branch_name` is many-to-one: `feature/foo`, `feature_foo` and
+/// `feature.foo` all map to `feature_foo`, so two distinct branches could
+/// otherwise be pointed at the same DB file and silently overwrite each
+/// other's index. When the readable stem is already claimed by a different
+/// branch, a short stable hash of the *full* branch name is appended, so the
+/// mapping stays deterministic (idempotent re-track) and collision-free.
+pub fn unique_branch_db_file(meta: &crate::branch_meta::BranchMeta, branch: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let stem = sanitize_branch_name(branch);
+    let candidate = format!("branches/{stem}.db");
+    let collides = meta
+        .branches
+        .iter()
+        .any(|(name, entry)| name != branch && entry.db_file == candidate);
+    if !collides {
+        return candidate;
+    }
+    let digest = Sha256::digest(branch.as_bytes());
+    let short = digest.iter().take(4).fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    format!("branches/{stem}-{short}.db")
+}
+
 /// Tracks `branch` by copying the nearest-ancestor DB into a per-branch DB and
 /// recording it in `BranchMeta`. This is the copy+record core shared by the
 /// `tokensave branch add` CLI command and the transparent auto-track paths.
@@ -193,7 +318,7 @@ pub fn find_nearest_tracked_ancestor(
 /// Returns `Ok(true)` when the branch is newly tracked, `Ok(false)` when nothing
 /// was done (no branch metadata yet → single-DB mode; the branch is the default;
 /// or it is already tracked). Never touches the default branch's `tokensave.db`.
-pub fn track_branch_copy(
+pub async fn track_branch_copy(
     project_root: &Path,
     tokensave_dir: &Path,
     branch: &str,
@@ -221,15 +346,11 @@ pub fn track_branch_copy(
         return Ok(false);
     }
 
-    let sanitized = sanitize_branch_name(branch);
-    let branches_dir = branch_meta::ensure_branches_dir(tokensave_dir)?;
-    let new_db_path = branches_dir.join(format!("{sanitized}.db"));
-    // ponytail: copies only the .db, matching `tokensave branch add`. If the
-    // ancestor has an uncheckpointed WAL (concurrent sync), that data is missed;
-    // upgrade path = checkpoint-before-copy applied to BOTH paths together.
-    std::fs::copy(&parent_db, &new_db_path)?;
+    let db_file = unique_branch_db_file(&meta, branch);
+    branch_meta::ensure_branches_dir(tokensave_dir)?;
+    let new_db_path = tokensave_dir.join(&db_file);
+    copy_branch_db(&parent_db, &new_db_path).await?;
 
-    let db_file = format!("branches/{sanitized}.db");
     meta.add_branch(branch, &db_file, &parent);
     branch_meta::save_branch_meta(tokensave_dir, &meta)?;
     Ok(true)
@@ -239,6 +360,23 @@ pub fn track_branch_copy(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_branch_db_file_avoids_collision() {
+        use crate::branch_meta::BranchMeta;
+        let mut meta = BranchMeta::new("main");
+        // First branch takes the plain sanitized stem.
+        let f1 = unique_branch_db_file(&meta, "feature/foo");
+        assert_eq!(f1, "branches/feature_foo.db");
+        meta.add_branch("feature/foo", &f1, "main");
+        // A different branch that sanitizes to the same stem must not reuse it.
+        let f2 = unique_branch_db_file(&meta, "feature_foo");
+        assert_ne!(f2, f1);
+        assert!(f2.starts_with("branches/feature_foo-") && f2.contains(".db"));
+        // Re-querying an already-tracked branch is idempotent: its own entry is
+        // excluded from the collision check so it keeps its plain stem.
+        assert_eq!(unique_branch_db_file(&meta, "feature/foo"), f1);
+    }
 
     #[test]
     fn sanitize_simple() {
@@ -263,27 +401,30 @@ mod tests {
         assert_eq!(sanitize_branch_name("foo/../bar"), "foo_bar");
     }
 
-    #[test]
-    fn track_branch_copy_copies_ancestor_and_is_idempotent() {
+    #[tokio::test]
+    async fn track_branch_copy_copies_ancestor_and_is_idempotent() {
         use crate::branch_meta;
         let dir = tempfile::TempDir::new().unwrap();
         let ts = dir.path(); // use as both project_root and tokensave_dir
                              // Seed default-branch metadata + its DB (no git repo → ancestor lookup
-                             // falls back to the default branch).
+                             // falls back to the default branch). Not a real SQLite file, which
+                             // also covers copy_branch_db's checkpoint-open failure path.
         branch_meta::save_branch_meta(ts, &branch_meta::BranchMeta::new("main")).unwrap();
         std::fs::write(ts.join("tokensave.db"), b"DBDATA").unwrap();
 
         // First call tracks the branch by copying the ancestor DB.
-        assert!(track_branch_copy(ts, ts, "feature-x").unwrap());
+        assert!(track_branch_copy(ts, ts, "feature-x").await.unwrap());
         assert!(ts.join("branches").join("feature-x.db").exists());
         assert!(branch_meta::load_branch_meta(ts)
             .unwrap()
             .is_tracked("feature-x"));
 
         // Idempotent: already tracked, default branch, and no-metadata are no-ops.
-        assert!(!track_branch_copy(ts, ts, "feature-x").unwrap());
-        assert!(!track_branch_copy(ts, ts, "main").unwrap());
+        assert!(!track_branch_copy(ts, ts, "feature-x").await.unwrap());
+        assert!(!track_branch_copy(ts, ts, "main").await.unwrap());
         let empty = tempfile::TempDir::new().unwrap();
-        assert!(!track_branch_copy(empty.path(), empty.path(), "x").unwrap());
+        assert!(!track_branch_copy(empty.path(), empty.path(), "x")
+            .await
+            .unwrap());
     }
 }

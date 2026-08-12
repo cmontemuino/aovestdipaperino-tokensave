@@ -3,15 +3,19 @@ use tokensave::db::migrations::latest_version;
 use tokensave::db::Database;
 use tokensave::types::*;
 
-/// Helper: create an in-memory-style temp database and return (Database, TempDir).
+/// Helper: create an in-memory-style temp database and return (TempDir, Database).
+///
+/// The `TempDir` comes first so that it is the last binding declared at each
+/// call site and therefore the last dropped: the database must close before the
+/// directory is removed, or Windows refuses the removal and leaks it (#367).
 /// The TempDir is returned so that it stays alive for the duration of the test.
-async fn setup_db() -> (Database, TempDir) {
+async fn setup_db() -> (TempDir, Database) {
     let dir = TempDir::new().expect("failed to create temp dir");
     let db_path = dir.path().join("test.db");
     let (db, _) = Database::initialize(&db_path)
         .await
         .expect("failed to initialize database");
-    (db, dir)
+    (dir, db)
 }
 
 /// Helper: create a sample node with reasonable defaults.
@@ -62,8 +66,31 @@ async fn test_initialize_creates_database() {
 }
 
 #[tokio::test]
+async fn test_database_read_only_state_matches_open_mode() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let db_path = dir.path().join("code_graph.db");
+
+    let (initialized, _) = Database::initialize(&db_path)
+        .await
+        .expect("failed to initialize database");
+    assert!(!initialized.is_read_only());
+    initialized.close();
+
+    let (opened, _) = Database::open(&db_path)
+        .await
+        .expect("failed to open database");
+    assert!(!opened.is_read_only());
+    opened.close();
+
+    let read_only = Database::open_read_only(&db_path)
+        .await
+        .expect("failed to open database read-only");
+    assert!(read_only.is_read_only());
+}
+
+#[tokio::test]
 async fn test_insert_and_get_node() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
     let node = sample_node("node-1", "process_data", "src/main.rs");
 
     db.insert_node(&node).await.expect("failed to insert node");
@@ -93,7 +120,7 @@ async fn test_insert_and_get_node() {
 
 #[tokio::test]
 async fn test_insert_and_get_edge() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
     let node_a = sample_node("node-a", "caller", "src/lib.rs");
     let node_b = sample_node("node-b", "callee", "src/lib.rs");
 
@@ -148,7 +175,7 @@ async fn test_insert_and_get_edge() {
 
 #[tokio::test]
 async fn test_upsert_file() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     let file = FileRecord {
         path: "src/main.rs".to_string(),
@@ -157,6 +184,7 @@ async fn test_upsert_file() {
         modified_at: 1000,
         indexed_at: 2000,
         node_count: 5,
+        kind: Default::default(),
     };
 
     db.upsert_file(&file).await.expect("failed to upsert file");
@@ -182,6 +210,7 @@ async fn test_upsert_file() {
         modified_at: 3000,
         indexed_at: 4000,
         node_count: 10,
+        kind: Default::default(),
     };
     db.upsert_file(&updated_file)
         .await
@@ -198,7 +227,7 @@ async fn test_upsert_file() {
 
 #[tokio::test]
 async fn test_fts_search() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     let node = sample_node("fts-node", "process_request", "src/handler.rs");
     db.insert_node(&node).await.expect("failed to insert node");
@@ -217,7 +246,7 @@ async fn test_fts_search() {
 
 #[tokio::test]
 async fn test_get_stats() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     let node = sample_node("stats-node", "my_func", "src/lib.rs");
     db.insert_node(&node).await.expect("failed to insert node");
@@ -236,7 +265,7 @@ async fn test_get_stats() {
 
 #[tokio::test]
 async fn test_delete_nodes_by_file() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     let node1 = sample_node("del-1", "func_a", "src/target.rs");
     let node2 = sample_node("del-2", "func_b", "src/target.rs");
@@ -278,7 +307,7 @@ async fn test_delete_nodes_by_file() {
 
 #[tokio::test]
 async fn test_unresolved_refs() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     // Insert a node first (FK constraint)
     let node = sample_node("ref-node", "my_func", "src/lib.rs");
@@ -322,7 +351,7 @@ async fn test_unresolved_refs() {
 
 #[tokio::test]
 async fn test_batch_insert_nodes() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     let nodes: Vec<Node> = (0..10)
         .map(|i| sample_node(&format!("batch-{i}"), &format!("func_{i}"), "src/batch.rs"))
@@ -341,7 +370,7 @@ async fn test_batch_insert_nodes() {
 
 #[tokio::test]
 async fn test_clear() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
 
     let node = sample_node("clear-1", "func", "src/lib.rs");
     db.insert_node(&node).await.expect("failed to insert node");
@@ -353,6 +382,7 @@ async fn test_clear() {
         modified_at: 1000,
         indexed_at: 2000,
         node_count: 1,
+        kind: Default::default(),
     };
     db.upsert_file(&file).await.expect("failed to upsert file");
 
@@ -366,7 +396,7 @@ async fn test_clear() {
 
 #[tokio::test]
 async fn test_get_node_not_found() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
     let result = db
         .get_node_by_id("nonexistent")
         .await
@@ -376,13 +406,13 @@ async fn test_get_node_not_found() {
 
 #[tokio::test]
 async fn test_optimize() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
     db.optimize().await.expect("optimize should not fail");
 }
 
 #[tokio::test]
 async fn test_database_size() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
     let size = db.size().await.expect("size should not fail");
     assert!(size > 0, "database should have non-zero size");
 }
@@ -534,9 +564,144 @@ async fn test_migrate_is_idempotent_at_latest() {
     assert!(!migrated, "second migrate should be a no-op");
 }
 
+// --- v14: search_terms column + porter FTS ---
+
+#[tokio::test]
+async fn test_migrate_v14_backfills_search_terms_and_rebuilds_fts() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("v13.db");
+
+    let lib_db = libsql::Builder::new_local(&db_path)
+        .build()
+        .await
+        .expect("build db");
+    let conn = lib_db.connect().expect("connect");
+
+    // v13-shaped schema: nodes without search_terms, 4-column unicode61 FTS.
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            start_column INTEGER NOT NULL,
+            end_column INTEGER NOT NULL,
+            docstring TEXT,
+            signature TEXT,
+            updated_at INTEGER NOT NULL,
+            attrs_start_line INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            name, qualified_name, docstring, signature,
+            content='nodes', content_rowid='rowid'
+        );
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
+            VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+        END;
+        INSERT INTO nodes (id, kind, name, qualified_name, file_path,
+                           start_line, end_line, start_column, end_column, updated_at)
+        VALUES ('camel', 'function', 'updateCloudClient',
+                'src/api/CloudSync.ts::updateCloudClient', 'src/api/CloudSync.ts',
+                1, 5, 0, 1, 1000),
+               ('snake', 'function', 'rerank_candidates',
+                'src/context/ranking.rs::rerank_candidates', 'src/context/ranking.rs',
+                10, 20, 0, 1, 1000);
+        PRAGMA user_version = 13;",
+    )
+    .await
+    .expect("v13 schema setup");
+
+    let migrated = tokensave::db::migrations::migrate(&conn)
+        .await
+        .expect("migrate failed");
+    assert!(migrated, "expected v14 migration to run");
+
+    let mut rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .expect("read version");
+    let v: u32 = rows
+        .next()
+        .await
+        .expect("version row")
+        .expect("version missing")
+        .get(0)
+        .expect("version value");
+    assert_eq!(v, latest_version());
+
+    // Backfill: camelCase row gets inner-word segments, snake_case stays empty.
+    let mut rows = conn
+        .query("SELECT search_terms FROM nodes WHERE id = 'camel'", ())
+        .await
+        .expect("select camel");
+    let terms: String = rows
+        .next()
+        .await
+        .expect("camel row")
+        .expect("camel missing")
+        .get(0)
+        .expect("terms");
+    assert!(
+        terms.contains("Cloud") && terms.contains("Client"),
+        "{terms}"
+    );
+    let mut rows = conn
+        .query("SELECT search_terms FROM nodes WHERE id = 'snake'", ())
+        .await
+        .expect("select snake");
+    let terms: String = rows
+        .next()
+        .await
+        .expect("snake row")
+        .expect("snake missing")
+        .get(0)
+        .expect("terms");
+    assert!(terms.is_empty(), "snake_case needs no extra terms: {terms}");
+
+    // Rebuilt FTS matches a camelCase inner word via search_terms…
+    let mut rows = conn
+        .query(
+            "SELECT n.id FROM nodes_fts JOIN nodes n ON nodes_fts.rowid = n.rowid
+             WHERE nodes_fts MATCH 'cloud'",
+            (),
+        )
+        .await
+        .expect("fts cloud");
+    let id: String = rows
+        .next()
+        .await
+        .expect("cloud row")
+        .expect("no match for 'cloud'")
+        .get(0)
+        .expect("id");
+    assert_eq!(id, "camel");
+
+    // …and porter stemming lets an inflected query term match the identifier.
+    let mut rows = conn
+        .query(
+            "SELECT n.id FROM nodes_fts JOIN nodes n ON nodes_fts.rowid = n.rowid
+             WHERE nodes_fts MATCH 'candidate'",
+            (),
+        )
+        .await
+        .expect("fts candidate");
+    let id: String = rows
+        .next()
+        .await
+        .expect("candidate row")
+        .expect("no match for 'candidate' (porter stemming inactive?)")
+        .get(0)
+        .expect("id");
+    assert_eq!(id, "snake");
+}
+
 #[tokio::test]
 async fn test_search_nodes_bounded_returns_real_descending_scores() {
-    let (db, _dir) = setup_db().await;
+    let (_dir, db) = setup_db().await;
     // One strong match (term in name) and one weak match (term only in docstring).
     let strong = sample_node("s", "ranking_engine", "src/rank.rs");
     let mut weak = sample_node("w", "helper", "src/helper.rs");
