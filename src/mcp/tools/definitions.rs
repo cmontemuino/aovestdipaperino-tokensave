@@ -76,10 +76,21 @@ fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
     properties.insert(
         "graph_root".to_string(),
         json!({
-            "type": "string",
+            // `anyOf` rather than `"type": ["string", "array"]` (#440): JSON
+            // Schema permits a union in `type`, but Gemini's
+            // function-declaration proto validates `items` against a single
+            // `Type.ARRAY` and rejects the whole request — every tool in it,
+            // not just this one. `anyOf` says the same thing and passes.
+            "anyOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+            ],
             "description": "Exact absolute initialized project root to query. Omit to query \
              the project this server already serves; when present it must name a different \
-             project."
+             project. `tokensave_search` and `tokensave_files` also accept an array of roots \
+             and answer across all of them at once, interleaving results by rank; roots that \
+             are worktrees of a repository already named are collapsed, and the response says \
+             which. Every other tool answers about a single graph and rejects an array."
         }),
     );
     properties.insert(
@@ -129,7 +140,11 @@ pub fn is_graph_scoped_tool(definition: &ToolDefinition) -> bool {
 /// and costing far more than the calls it discouraged. Keep this a `const`;
 /// never derive any part of it from graph state.
 pub const CONTEXT_DESCRIPTION: &str = "Build an AI-ready context for a task description. \
-     Returns relevant symbols, relationships, and optionally code snippets.";
+     Returns relevant symbols, relationships, and optionally code snippets. \
+     The output includes a `### Retrieval` section: when it lists zero-hit terms, \
+     re-query once with `keywords` synonyms for them (or use tokensave_search); \
+     a `match: fts-only` tier means weak lexical matches, so verify entry points \
+     before building on them.";
 
 /// Returns the list of all tool definitions exposed by this MCP server.
 ///
@@ -149,6 +164,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         graph_scoped(def_files()),
         def_affected(),
         graph_scoped(def_dead_code()),
+        graph_scoped(def_ambiguous_calls()),
         def_diff_context(),
         graph_scoped(def_module_api()),
         graph_scoped(def_circular()),
@@ -286,7 +302,9 @@ fn def_search() -> ToolDefinition {
     def_always_load(
         "tokensave_search",
         "Search Symbols",
-        "Search for symbols (functions, structs, traits, etc.) in the code graph by name or keyword.",
+        "Search for symbols (functions, structs, traits, etc.) in the code graph by name or keyword. \
+         Persistent noise (vendored trees, docs) can be suppressed project-wide via gitignore-style \
+         patterns in .tokensave/queryignore.",
         json!({
             "type": "object",
             "properties": {
@@ -668,6 +686,37 @@ fn def_affected() -> ToolDefinition {
                 }
             },
             "required": ["files"]
+        }),
+    )
+}
+
+fn def_ambiguous_calls() -> ToolDefinition {
+    def(
+        "tokensave_ambiguous_calls",
+        "Ambiguous Calls",
+        "List call sites the resolver could not pin to a single target, with the \
+         candidates it could not separate. These produce no `calls` edge, because \
+         an edge asserts a specific target and \"one of these\" is not one — so \
+         they are invisible to `callers`, `callees` and `impact`. \
+         \n\nUse this when a call you expect is missing from the graph, or when \
+         `dead_code` seems to have skipped something: a symbol named here is \
+         referenced, just not attributably. You have the source and can usually \
+         tell which candidate was meant from the receiver's type, which the \
+         resolver cannot see. Typically arises where several classes define the \
+         same method name and the receiver's type is unknowable — an untyped \
+         parameter, or a value from an unindexed package.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Restrict to call sites in this file or directory."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum call sites to return (default 25, max 200). A hard cap, not a page: a large codebase can hold thousands."
+                }
+            }
         }),
     )
 }
@@ -2627,6 +2676,7 @@ mod tests {
             "tokensave_node",
             "tokensave_files",
             "tokensave_dead_code",
+            "tokensave_ambiguous_calls",
             "tokensave_module_api",
             "tokensave_circular",
             "tokensave_hotspots",
@@ -2706,12 +2756,36 @@ mod tests {
             );
 
             if expected {
-                assert_eq!(graph_root.unwrap()["type"], "string", "{}", definition.name);
+                // A union, not `"string"`: a single root is still a string, and
+                // `search`/`files` also accept an array to federate across
+                // roots (#376). Spelled `anyOf` rather than
+                // `"type": ["string", "array"]` because Gemini rejects the
+                // latter (#440), and asserted exactly rather than loosened to
+                // "any type" so a future edit cannot quietly widen what
+                // callers may pass — or regress to the union that broke.
+                assert!(
+                    graph_root.unwrap().get("type").is_none(),
+                    "{} must not carry a union `type` (#440)",
+                    definition.name
+                );
+                assert_eq!(
+                    graph_root.unwrap()["anyOf"],
+                    serde_json::json!([
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]),
+                    "{}",
+                    definition.name
+                );
                 assert_eq!(
                     graph_root.unwrap()["description"],
                     "Exact absolute initialized project root to query. Omit to query the \
                      project this server already serves; when present it must name a different \
-                     project.",
+                     project. `tokensave_search` and `tokensave_files` also accept an array of \
+                     roots and answer across all of them at once, interleaving results by rank; \
+                     roots that are worktrees of a repository already named are collapsed, and \
+                     the response says which. Every other tool answers about a single graph and \
+                     rejects an array.",
                     "{}",
                     definition.name
                 );
@@ -2745,7 +2819,7 @@ mod tests {
             .filter(|definition| is_graph_scoped_tool(definition))
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(actual.len(), 51);
+        assert_eq!(actual.len(), 52);
         assert_eq!(actual, canonical);
     }
 

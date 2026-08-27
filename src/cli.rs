@@ -139,6 +139,11 @@ pub enum Commands {
         /// instead of the global config.
         #[arg(long)]
         local: bool,
+        /// Leave tokensave's global git hooks in place. Without this, a global
+        /// uninstall removes them, so a later commit cannot recreate an index
+        /// (#420).
+        #[arg(long)]
+        keep_git_hooks: bool,
     },
     /// Extraction worker (spawned by tokensave itself; not for direct use).
     #[command(name = "extract-worker", hide = true)]
@@ -213,6 +218,13 @@ pub enum Commands {
         #[arg(short, long)]
         path: Option<String>,
         /// "on" to enable, "off" to disable, omit to show current setting
+        action: Option<String>,
+    },
+    /// Show or remove the global git hooks tokensave installs
+    #[command(name = "githooks")]
+    Githooks {
+        /// "off" to remove tokensave's global git hooks, "on" to install them,
+        /// omit to show what is currently installed
         action: Option<String>,
     },
     /// Check tokensave installation, configuration, and agent integration
@@ -341,6 +353,16 @@ pub enum BranchAction {
         /// Project path (default: current directory)
         #[arg(short, long)]
         path: Option<String>,
+        /// Only track when auto-tracking is enabled, otherwise exit
+        /// successfully without doing anything (#397).
+        ///
+        /// For automated callers — the `post-checkout` hook passes this — so
+        /// the `auto_track` config field (or `TOKENSAVE_AUTO_TRACK`) governs
+        /// auto-tracking on every entry point rather than only inside
+        /// `TokenSave::open`. A human typing `branch add` has asked for it, so
+        /// the flag is opt-in rather than the default.
+        #[arg(long)]
+        if_enabled: bool,
     },
     /// Remove a tracked branch and delete its DB
     Remove {

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::errors::{Result, TokenSaveError};
 use crate::tokensave::TokenSave;
-use crate::types::{NodeKind, Visibility};
+use crate::types::NodeKind;
 
 use super::super::ToolResult;
 use super::{
@@ -419,6 +419,88 @@ pub(super) async fn handle_dead_code(
     })
 }
 
+/// Handles `tokensave_ambiguous_calls` tool calls (#412).
+///
+/// Surfaces the ties the resolver refused to guess at. Each candidate is
+/// returned with the detail needed to choose between them — name, kind, file
+/// and line — because the caller is a model with the source in front of it and
+/// can read the receiver's type, which the resolver cannot.
+pub(super) async fn handle_ambiguous_calls(
+    cg: &TokenSave,
+    args: Value,
+    scope_prefix: Option<&str>,
+) -> Result<ToolResult> {
+    let path_prefix = effective_path(&args, scope_prefix);
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(25, |v| v.min(200) as usize);
+
+    let ambiguous = cg.db().get_ambiguous_calls(path_prefix, limit).await?;
+
+    // One batched lookup for every candidate across every site, rather than a
+    // query per site.
+    let candidate_ids: Vec<String> = ambiguous
+        .iter()
+        .flat_map(|a| a.candidate_node_ids.iter().cloned())
+        .collect();
+    let candidates = cg.db().get_nodes_by_ids(&candidate_ids).await?;
+    let by_id: HashMap<&str, &crate::types::Node> =
+        candidates.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    let mut touched_files: Vec<String> = Vec::new();
+    let items: Vec<Value> = ambiguous
+        .iter()
+        .map(|a| {
+            touched_files.push(a.file_path.clone());
+            let options: Vec<Value> = a
+                .candidate_node_ids
+                .iter()
+                .filter_map(|id| by_id.get(id.as_str()))
+                .map(|n| {
+                    touched_files.push(n.file_path.clone());
+                    json!({
+                        "id": n.id,
+                        "name": n.name,
+                        "kind": n.kind.as_str(),
+                        "file": n.file_path,
+                        "line": super::display_line(n.start_line),
+                        "qualified_name": n.qualified_name,
+                    })
+                })
+                .collect();
+            json!({
+                "call_site": {
+                    "from_node_id": a.from_node_id,
+                    "file": a.file_path,
+                    "line": super::display_line(a.line),
+                },
+                "reference": a.reference_name,
+                "candidates": options,
+            })
+        })
+        .collect();
+
+    touched_files.sort();
+    touched_files.dedup();
+
+    let output = json!({
+        "ambiguous_call_count": items.len(),
+        "note": "These call sites produce no `calls` edge, so they are absent from \
+                 callers/callees/impact, and their candidates are excluded from \
+                 dead_code. Pick the intended target from the receiver's type.",
+        "ambiguous_calls": items,
+    });
+
+    let formatted = serde_json::to_string_pretty(&output).unwrap_or_default();
+    Ok(ToolResult {
+        value: json!({
+            "content": [{ "type": "text", "text": truncate_response(&formatted) }]
+        }),
+        touched_files,
+    })
+}
+
 /// Handles `tokensave_module_api` tool calls.
 pub(super) async fn handle_module_api(
     cg: &TokenSave,
@@ -429,22 +511,14 @@ pub(super) async fn handle_module_api(
         message: "missing required parameter: path".to_string(),
     })?;
 
-    let all_nodes = cg.get_all_nodes().await?;
+    // Public nodes under `path`, selected in SQL rather than by loading the
+    // whole node table and discarding the rest (#410).
+    let scoped = cg
+        .db()
+        .get_nodes_filtered(&crate::db::NodeFilter::new().path_prefix(path).public_only())
+        .await?;
 
-    // Filter to nodes in matching files (exact path or directory prefix)
-    let prefix = if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    };
-
-    let mut pub_nodes: Vec<&crate::types::Node> = all_nodes
-        .iter()
-        .filter(|n| {
-            n.visibility == Visibility::Pub
-                && (n.file_path == path || n.file_path.starts_with(&prefix))
-        })
-        .collect();
+    let mut pub_nodes: Vec<&crate::types::Node> = scoped.iter().collect();
 
     pub_nodes.sort_by(|a, b| {
         a.file_path
@@ -583,22 +657,11 @@ pub(super) async fn handle_hotspots(
         .map_or(10, |v| v.min(100) as usize);
     debug_assert!(limit > 0, "handle_hotspots limit must be positive");
 
-    let all_edges = cg.get_all_edges().await?;
-
-    // Count incoming + outgoing edges per node
-    let mut connectivity: HashMap<String, (usize, usize)> = HashMap::new();
-    for edge in &all_edges {
-        connectivity.entry(edge.source.clone()).or_insert((0, 0)).1 += 1; // outgoing
-        connectivity.entry(edge.target.clone()).or_insert((0, 0)).0 += 1; // incoming
-    }
-
-    // Sort by total connectivity descending
-    let mut sorted: Vec<(String, usize, usize)> = connectivity
-        .into_iter()
-        .map(|(id, (inc, out))| (id, inc, out))
-        .collect();
-    sorted.sort_by_key(|x| std::cmp::Reverse(x.1 + x.2));
-    sorted.truncate(limit);
+    // Degrees are tallied, sorted and truncated in SQL. Loading all 25,580
+    // edges here to emit at most `limit` rows — 10 by default, 100 at most —
+    // was #418's clearest case. The path filters below still run afterwards on
+    // the same rows they always did, so the result set is unchanged.
+    let sorted: Vec<(String, u32, u32)> = cg.db().get_top_degree_nodes(limit).await?;
 
     // Resolve node details
     let mut items: Vec<Value> = Vec::new();
@@ -684,23 +747,14 @@ pub(super) async fn handle_unused_imports(
         &cfg.default_path_exclude,
     );
 
-    let all_nodes = cg.get_all_nodes().await?;
+    // `Use` nodes under the requested path, selected in SQL (#410).
+    let mut use_filter = crate::db::NodeFilter::new().kinds(&[NodeKind::Use]);
+    if let Some(prefix) = path_prefix {
+        use_filter = use_filter.path_prefix(prefix);
+    }
+    let scoped_uses = cg.db().get_nodes_filtered(&use_filter).await?;
 
-    // Find all Use nodes
-    let use_nodes: Vec<&crate::types::Node> = all_nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Use)
-        .filter(|n| {
-            path_prefix.is_none_or(|prefix| {
-                let with_slash = if prefix.ends_with('/') {
-                    prefix.to_string()
-                } else {
-                    format!("{prefix}/")
-                };
-                n.file_path.starts_with(&with_slash) || n.file_path == prefix
-            })
-        })
-        .collect();
+    let use_nodes: Vec<&crate::types::Node> = scoped_uses.iter().collect();
     let use_nodes = filter_by_path_lists(use_nodes, &path_include, &path_exclude, |n| &n.file_path);
 
     let mut unused: Vec<Value> = Vec::new();
@@ -1462,12 +1516,16 @@ fn dfs_cycle_path<'a>(
 /// score reported by `tokensave_complexity`.
 async fn test_reached_node_ids(cg: &TokenSave) -> Result<HashSet<String>> {
     use crate::types::EdgeKind;
-    let all_nodes = cg.get_all_nodes().await?;
-    let all_edges = cg.get_all_edges().await?;
-    let node_to_file: HashMap<String, String> = all_nodes
-        .iter()
-        .map(|n| (n.id.clone(), n.file_path.clone()))
-        .collect();
+    // `calls` only, selected in SQL: every use below filters on the kind, and
+    // `calls` is 19,282 of this repository's 25,580 edges, so the rest was a
+    // quarter of the load carried and discarded (#418).
+    let all_edges = cg.db().get_edges_by_kind(EdgeKind::Calls).await?;
+    // Graph-wide id -> file_path, projected in SQL (#411). Every node is
+    // needed, because a `Calls` edge can originate anywhere and the question
+    // is whether its *source* lives in a test file — but the other twenty-six
+    // columns never are. This was the last `get_all_nodes()` call site in the
+    // handlers whose load was pure overhead.
+    let node_to_file: HashMap<String, String> = cg.db().get_node_paths().await?;
     let call_source_ids: Vec<String> = all_edges
         .iter()
         .filter(|e| e.kind == EdgeKind::Calls)
