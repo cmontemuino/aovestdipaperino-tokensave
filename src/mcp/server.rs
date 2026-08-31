@@ -30,6 +30,16 @@ use super::tools::{
 };
 use super::transport::{ErrorCode, JsonRpcRequest, JsonRpcResponse};
 
+/// Selector-less local graph tools refused after tracked-branch drift.
+pub(crate) const LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS: &[&str] = &[
+    "tokensave_affected",
+    "tokensave_diff_context",
+    "tokensave_simplify_scan",
+    "tokensave_redundancy",
+    "tokensave_diagnostics",
+    "tokensave_diagnose",
+];
+
 /// Runtime statistics for the MCP server.
 pub struct ServerStats {
     started_at: Instant,
@@ -51,6 +61,13 @@ impl ServerStats {
 
 /// Cache duration for version checks (15 minutes).
 const VERSION_CHECK_INTERVAL: Duration = Duration::from_mins(15);
+
+/// How often a running server bothers to *consider* a worldwide-counter upload.
+///
+/// This is a re-entry guard, not the upload cadence: it only keeps a busy
+/// server from reading the user config on every tool call. Whether a request is
+/// actually made is `cloud::upload_is_due`, which is daily.
+const FLUSH_CHECK_INTERVAL_SECS: i64 = 30;
 
 /// Hand-maintained schema documentation for the `tokensave://schema` resource.
 /// Mirrors `src/db/migrations.rs::create_schema`. Update both together.
@@ -405,6 +422,42 @@ fn auto_sync_refusal(scope: &crate::tokensave::AutoSyncScope) -> String {
     }
 }
 
+/// The deferral rule for [`McpServer::startup_work_in_flight`], as a pure
+/// function of the three flags so the truth table can be tested directly.
+///
+/// The asymmetry between the two jobs is deliberate. Startup catch-up is
+/// spawned unconditionally, so its `done` flag always settles and "not done"
+/// really does mean "still running". A version reindex may never be triggered
+/// at all, so it defers only while *started and not finished* — keying on
+/// `!done` alone would make every ordinary session defer forever and the
+/// option would silently do nothing.
+fn defer_idle_exit(catch_up_done: bool, reindex_started: bool, reindex_done: bool) -> bool {
+    !catch_up_done || (reindex_started && !reindex_done)
+}
+
+/// Sleep until `d` elapses, or never when there is no deadline.
+///
+/// Created fresh at each park, so the window always starts whole and never
+/// spans request handling.
+async fn idle_deadline(d: Option<std::time::Duration>) {
+    match d {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Say why the server is leaving. An idle exit is indistinguishable from a
+/// crash in a host's log otherwise, and the whole point of the option is that
+/// an operator turned it on and wants to see it working.
+fn report_idle_exit(d: Option<std::time::Duration>) {
+    if let Some(d) = d {
+        eprintln!(
+            "[tokensave] idle for {}s with no request — exiting (--idle-timeout-secs)",
+            d.as_secs()
+        );
+    }
+}
+
 impl McpServer {
     /// Creates a new MCP server backed by the given code graph.
     ///
@@ -624,15 +677,6 @@ impl McpServer {
     /// graph reads are unaffected, and explicit external `graph_root`
     /// selections never reach this gate.
     fn branch_drift_refusal(&self, tool_name: &str) -> Option<String> {
-        const LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS: &[&str] = &[
-            "tokensave_affected",
-            "tokensave_diff_context",
-            "tokensave_simplify_scan",
-            "tokensave_redundancy",
-            "tokensave_diagnostics",
-            "tokensave_diagnose",
-        ];
-
         if tool_name == "tokensave_status"
             || (!self.graph_scoped_tools.contains(tool_name)
                 && !LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS.contains(&tool_name))
@@ -1102,15 +1146,26 @@ impl McpServer {
             .unwrap_or_default()
     }
 
-    /// Flushes pending tokens to the worldwide counter if at least 30 seconds
-    /// have elapsed since the last flush. Best-effort, never blocks for long.
+    /// Uploads the accumulated saved-token delta to the worldwide counter, at
+    /// most once a day. Best-effort, never blocks for long.
+    ///
+    /// Two gates, doing different jobs. The in-process one keeps a busy server
+    /// from loading the user config on every single tool call; the daily one in
+    /// `cloud::upload_is_due` decides whether a request is actually made, and is
+    /// shared with the CLI so both cadences are the same decision.
+    ///
+    /// Nothing is lost by declining to upload: `last_flushed_tokens` advances
+    /// only on success, so the delta is re-derived from the running total next
+    /// time. That is also why the accumulated total is not *persisted* when the
+    /// upload is skipped — writing it while `last_flushed_tokens` stays put
+    /// would count the same tokens twice.
     async fn maybe_flush_worldwide(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let last = self.last_flush_at.load(Ordering::Relaxed);
-        if now - last < 30 {
+        if now - last < FLUSH_CHECK_INTERVAL_SECS {
             return;
         }
         // Mark as attempted immediately to prevent re-entry.
@@ -1126,13 +1181,14 @@ impl McpServer {
         let success = tokio::task::spawn_blocking(move || {
             let mut config = crate::user_config::UserConfig::load();
             config.pending_upload += delta;
-            if config.upload_enabled && crate::cloud::flush_pending(config.pending_upload).is_some()
-            {
+            if !crate::cloud::upload_is_due(&config, now) {
+                // Deliberately not saved: see the note above on double counting.
+                return false;
+            }
+            config.last_flush_attempt_at = now;
+            if crate::cloud::flush_pending(config.pending_upload).is_some() {
                 config.pending_upload = 0;
-                config.last_upload_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                config.last_upload_at = now;
                 config.save();
                 return true;
             }
@@ -1231,29 +1287,112 @@ impl McpServer {
         self: &Arc<Self>,
         transport: &mut impl super::transport::McpTransport,
     ) -> Result<()> {
+        self.run_with_idle_timeout(transport, None).await
+    }
+
+    /// Is a detached startup job still running?
+    ///
+    /// The idle deadline must not cut one of these off. Both are spawned
+    /// rather than awaited, so a server can look idle — no request in flight,
+    /// nothing on stdin — while it is still doing the work a client is about
+    /// to depend on. Startup catch-up is always spawned, so its `done` flag
+    /// settles either way; the version reindex is checked as
+    /// started-and-not-finished, because a session that never triggers one
+    /// must not be treated as forever busy.
+    fn startup_work_in_flight(&self) -> bool {
+        defer_idle_exit(
+            self.startup_catch_up_done.load(Ordering::Acquire),
+            self.version_reindex_started.load(Ordering::Acquire),
+            self.version_reindex_done.load(Ordering::Acquire),
+        )
+    }
+
+    /// Run the MCP loop, optionally exiting after `idle_timeout` passes with
+    /// no request (#436).
+    ///
+    /// A host that keeps a finished subagent's server alive never closes its
+    /// stdin, so the EOF that would normally stop the server never arrives and
+    /// one server accumulates per subagent, each holding its index open. That
+    /// is the host's bug to fix — the servers are all children of the same
+    /// still-live supervisor, so there is no dead-parent signal to key on
+    /// either — but a deadline bounds the damage without waiting for it.
+    ///
+    /// Off unless asked for. Whether this is safe depends on the host starting
+    /// a fresh server when a tool is called after an idle exit, which varies by
+    /// host and is not something tokensave can detect, so the default stays
+    /// today's indefinite lifetime.
+    ///
+    /// The deadline is evaluated **only** while parked waiting for the next
+    /// line, never during request handling: the timer is created fresh each
+    /// time the loop parks, so a request that takes longer than the timeout
+    /// cannot be interrupted by it, and the window after it starts whole.
+    /// Requests are handled serially, so no in-flight counter is needed.
+    pub async fn run_with_idle_timeout(
+        self: &Arc<Self>,
+        transport: &mut impl super::transport::McpTransport,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
         let already_started = self.run_started.swap(true, Ordering::Relaxed);
         debug_assert!(
             !already_started,
             "server run() called on an already-used server"
         );
 
-        loop {
-            let line: String = {
+        // Registered once, for the life of the loop, rather than per
+        // iteration (#450/#436).
+        //
+        // Creating the stream inside the loop meant it existed only while
+        // `select!` awaited the next line, and was dropped before
+        // `handle_request` ran. Tokio's registration is process-global and is
+        // *not* undone on drop, so the default disposition — terminate — was
+        // permanently replaced after the first iteration, while for most of a
+        // busy server's life nothing was listening. A SIGTERM delivered during
+        // request handling therefore neither killed the process nor reached
+        // the loop: the next iteration built a fresh stream, which cannot see
+        // an event delivered before it existed. That is the reported
+        // behaviour, a server that ignores `kill` and needs `SIGKILL`.
+        //
+        // Held across the whole loop, the stream coalesces and retains a
+        // signal delivered while it is not being polled, so a SIGTERM arriving
+        // mid-request is observed at the top of the next iteration and the
+        // server leaves through the normal graceful shutdown. Note this waits
+        // for the in-flight request to finish; interrupting a long sync
+        // mid-flight is a separate decision, tracked on #450.
+        #[cfg(unix)]
+        #[allow(clippy::expect_used)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
+        'serve: loop {
+            // The inner loop exists only so a deferred idle expiry can re-arm:
+            // a deadline that lands while a detached startup job is still
+            // running is not evidence the server is finished with, so it waits
+            // out another whole window rather than exiting or being ignored.
+            let line: String = 'wait: loop {
                 #[cfg(unix)]
                 {
-                    #[allow(clippy::expect_used)]
-                    let mut sigterm =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("failed to register SIGTERM handler");
                     tokio::select! {
                         result = transport.read_line() => {
                             match result {
-                                Ok(Some(line)) => line,
-                                _ => break,
+                                Ok(Some(line)) => break 'wait line,
+                                _ => break 'serve,
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => break,
-                        _ = sigterm.recv() => break,
+                        _ = tokio::signal::ctrl_c() => break 'serve,
+                        _ = sigterm.recv() => break 'serve,
+                        // Set by the process-wide handler in `cancel`, which
+                        // observes a signal the moment it lands rather than
+                        // only while this loop is parked here — and by the
+                        // orphan watchdog, which has no signal to deliver at
+                        // all (#450).
+                        () = crate::cancel::cancelled() => break 'serve,
+                        () = idle_deadline(idle_timeout) => {
+                            if self.startup_work_in_flight() {
+                                continue 'wait;
+                            }
+                            report_idle_exit(idle_timeout);
+                            break 'serve;
+                        }
                     }
                 }
                 #[cfg(not(unix))]
@@ -1261,11 +1400,19 @@ impl McpServer {
                     tokio::select! {
                         result = transport.read_line() => {
                             match result {
-                                Ok(Some(line)) => line,
-                                _ => break,
+                                Ok(Some(line)) => break 'wait line,
+                                _ => break 'serve,
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => break,
+                        _ = tokio::signal::ctrl_c() => break 'serve,
+                        () = crate::cancel::cancelled() => break 'serve,
+                        () = idle_deadline(idle_timeout) => {
+                            if self.startup_work_in_flight() {
+                                continue 'wait;
+                            }
+                            report_idle_exit(idle_timeout);
+                            break 'serve;
+                        }
                     }
                 }
             };
@@ -1314,11 +1461,11 @@ impl McpServer {
                 let output = format!("{json_line}\n");
                 if let Err(e) = transport.write_line(&output).await {
                     eprintln!("failed to write response: {e}");
-                    break;
+                    break 'serve;
                 }
                 if let Err(e) = transport.flush().await {
                     eprintln!("failed to flush stdout: {e}");
-                    break;
+                    break 'serve;
                 }
             }
         }
@@ -1354,19 +1501,24 @@ impl McpServer {
             gdb.checkpoint().await;
         }
 
-        // Flush remaining delta to worldwide counter (what periodic flushes missed)
+        // Record the remaining delta the periodic flushes did not upload, and
+        // upload it only if a day has passed. Unlike the periodic path this
+        // always *persists* the accumulated total: the process is ending, so
+        // `last_flushed_tokens` is about to be lost and the config file is the
+        // only thing that will still remember these tokens.
         let last_flushed = self.last_flushed_tokens.load(Ordering::Relaxed);
         if tokens_saved > last_flushed {
             let delta = tokens_saved - last_flushed;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             let mut config = crate::user_config::UserConfig::load();
             config.pending_upload += delta;
-            if config.upload_enabled {
-                if let Some(_total) = crate::cloud::flush_pending(config.pending_upload) {
+            if crate::cloud::upload_is_due(&config, now) {
+                config.last_flush_attempt_at = now;
+                if crate::cloud::flush_pending(config.pending_upload).is_some() {
                     config.pending_upload = 0;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
                     config.last_upload_at = now;
                 }
             }
@@ -2465,5 +2617,40 @@ mod staleness_banner_tests {
         assert!(!warning.contains('`'));
         assert!(!warning.contains("tokensave branch add"));
         assert!(!warning.contains("tokensave sync --path"));
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::defer_idle_exit;
+
+    /// Startup catch-up is spawned unconditionally, so "not done" means it is
+    /// genuinely still walking the tree — and cutting that off would abandon
+    /// work the next client request depends on.
+    #[test]
+    fn a_running_startup_catch_up_defers_the_exit() {
+        assert!(defer_idle_exit(false, false, false));
+        assert!(defer_idle_exit(false, true, true));
+    }
+
+    /// The case that would have made the whole option a no-op: a session that
+    /// never triggers a version reindex leaves `reindex_done` false forever, so
+    /// keying on that alone would defer every expiry on every server.
+    #[test]
+    fn a_reindex_that_never_started_does_not_defer_forever() {
+        assert!(
+            !defer_idle_exit(true, false, false),
+            "an ordinary idle server must be allowed to exit"
+        );
+    }
+
+    #[test]
+    fn a_running_version_reindex_defers_the_exit() {
+        assert!(defer_idle_exit(true, true, false));
+    }
+
+    #[test]
+    fn a_finished_reindex_stops_deferring() {
+        assert!(!defer_idle_exit(true, true, true));
     }
 }

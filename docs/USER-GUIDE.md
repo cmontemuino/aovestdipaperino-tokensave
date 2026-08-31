@@ -370,13 +370,52 @@ During `tokensave install`, you'll be offered a global git `post-commit` hook. I
 
 If you're scripting the install (CI, dotfiles bootstrap, onboarding playbook), pass `--git-hook yes` to install the hook without prompting, or `--git-hook no` to skip it. Omitting the flag preserves the interactive prompt.
 
+#### Per-repository hooks instead of global ones
+
+The global hooks work by claiming `core.hooksPath`, which is a **single
+machine-wide setting**. It overrides git's default of a separate `.git/hooks`
+per checkout, so every repository on the machine is forced to share one hook
+directory — which is wrong if your projects need different tooling (#455).
+
+Per-repository hooks avoid that entirely. They go in the repository's own hook
+directory and touch no git config at all, so nothing else on the machine
+changes:
+
+```bash
+tokensave githooks on --local      # install into this repository only
+tokensave githooks --local         # show what this repository has
+tokensave githooks off --local     # remove them from this repository
+```
+
+`tokensave init` offers them for you. Accept and the three hooks are installed;
+decline and nothing is written. It only asks on a terminal, so scripted and CI
+installs are unaffected, and it stays quiet when tokensave's global hooks are
+already installed — a repository covered by both would sync twice per commit.
+
+```bash
+tokensave init --git-hook       # install without asking
+tokensave init --no-git-hook    # don't ask, don't install
+```
+
+Writing is additive: a repository that already has a `post-commit` — husky,
+pre-commit, or one you wrote — keeps everything it had and gains a marked
+tokensave section. Linked worktrees share the checkout's hook directory, which
+is what git itself reads, so installing from inside a worktree does the right
+thing.
+
+One thing to watch: if a `core.hooksPath` is set for the repository, from any
+config scope, git reads hooks from *there* and never looks at the repository's
+own directory. Local hooks would be written but never run, so tokensave says so
+rather than reporting a success that is not one.
+
 #### Removing the git hooks
 
 The hooks are global and outlive every agent integration, so removing tokensave from your agents does not stop them on its own (#420). Two ways to remove them:
 
 ```bash
 tokensave githooks              # show what is installed, and where
-tokensave githooks off          # remove tokensave's hooks
+tokensave githooks off          # remove tokensave's global hooks
+tokensave githooks off --local  # remove this repository's own hooks
 tokensave uninstall             # removes the hooks along with all agent integrations
 tokensave uninstall --keep-git-hooks   # ...or keep them
 ```
@@ -474,6 +513,173 @@ guard always applies).
 The `watcher_debounce` setting in `~/.tokensave/config.toml` is left over
 from that watcher. It is still accepted, but nothing reads it, and the
 30-second cooldown is not configurable.
+
+### Interrupting a sync
+
+`Ctrl-C` and `kill` stop a sync in progress rather than waiting for it to
+finish. A sync polls for the request in the phases that dominate its runtime —
+the parallel extraction pass and the per-file write loop — so on a large tree
+it stops in well under a second instead of minutes.
+
+Stopping is always safe. The index keeps its stale marker, so the next sync
+redoes the abandoned work, and the sync lock is released so that next sync can
+run at all. What the message tells you is how far it got:
+
+- *"no partial results were committed"* — it stopped before anything was
+  written.
+- *"partway through writing"* — some files were updated and others were not.
+  This is the same state a power cut would leave, and the next `tokensave
+  sync` resolves it.
+
+An MCP server is subject to the same thing: a `kill` during its automatic
+catch-up sync now takes effect during the sync rather than after it.
+
+### Index scope warnings
+
+A `serve` warns on stderr, once at startup, about an index whose *scope* looks
+wrong rather than whose contents do:
+
+- **Your home directory is initialised as a project.** Every server started
+  there indexes your whole home tree. This is reported wherever you are
+  standing, because the whole problem with this state is that nobody is
+  standing in it when it does the damage (#450).
+- **The index is larger than 5 GB.** A server maps the whole file.
+
+Both are warnings, not refusals, and the server starts normally. An index that
+already exists is a working setup, and refusing it retroactively would decide
+for you which of your projects stop working. If you meant it, set
+`suppress_scope_warning: true` in `.tokensave/config.json` to stop being told.
+`tokensave doctor` reports the same two conditions and ignores the switch.
+
+### Orphaned servers
+
+On Unix, a `serve` whose launching process has died exits on its own within
+about 30 seconds. A host that exits without closing the server's stdin used to
+leave the server running indefinitely with its whole index mapped, to be found
+and killed by hand (#450). This covers a *dead* parent only; duplicate servers
+under a still-live host are a host-side problem (#436).
+
+### Bounding a host that leaks servers
+
+Some MCP hosts start a **new** server per subagent and keep every one of them
+alive after the subagent that used it has finished. They are all children of
+the same still-live supervisor, so nothing ever closes their stdin and the EOF
+that would normally stop them never arrives; each one goes on holding its index
+open. A four-server pile-up measured on Windows cost roughly 113 MB private
+memory and 922 handles.
+
+This is the host's bug — the same hosts retain duplicate fleets of unrelated
+MCP servers too — and tokensave cannot detect it: a parent-PID watchdog has
+nothing to key on, because the parent is alive. What tokensave can do is stop
+waiting:
+
+```bash
+tokensave serve --idle-timeout-secs 900
+```
+
+The server exits after that many seconds with no request, through the ordinary
+graceful shutdown (counters persisted, WAL checkpointed, registry entry
+removed).
+
+**Off by default, and check one thing before turning it on.** Whether this is
+safe depends on your host starting a fresh server when a tool is called after
+an idle exit. Most do; tokensave cannot verify it for yours, and if yours does
+not, tools stop working until the host is restarted. Try it on one project
+first.
+
+Two things it deliberately does not do:
+
+- **It never interrupts a request.** The deadline is evaluated only while the
+  server is parked waiting for the next request, and the timer restarts each
+  time it parks — so a request slower than the timeout cannot be cut off, and a
+  server busier than its timeout never expires.
+- **It never cuts off startup work.** A deadline landing while the startup
+  catch-up sync or a version-bump reindex is still running is deferred, and
+  waits out another full window.
+
+This is host-integration policy rather than project state, so it lives on the
+command line only — there is no config-file equivalent, and `tokensave install`
+does not add it to generated host config for you.
+
+### Finding which server holds an index
+
+A `serve` process keeps an exclusive handle on its database for as long as it
+runs — file watching is why the process is long-lived, and the handle comes
+with it. So an indexed directory cannot be deleted while a client has a server
+up. On Linux and macOS the delete succeeds and the space is reclaimed when the
+last handle closes; on Windows it fails outright:
+
+```
+Remove-Item: The process cannot access the file
+'...\.tokensave\tokensave.db' because it is being used by another process.
+```
+
+This bites most often on git worktrees: a worktree per task, each one indexed,
+each one cleaned up afterwards. `git worktree remove` deregisters the worktree
+even when the file delete fails, which leaves git metadata pruned and the
+directory still on disk.
+
+`tokensave servers` names the holder:
+
+```bash
+tokensave servers
+```
+
+```
+  PID  VERSION  PROJECT
+87904   7.11.0  /Users/you/Code/app/worktrees/feature-x
+```
+
+A per-branch database is not derivable from the project root, so it is shown
+on its own line when it is not the default `<project>/.tokensave/tokensave.db`.
+
+Most servers carry no project in their command line — the host supplies it
+through the global database or MCP `initialize` roots rather than `--path` — so
+a process lister cannot answer this and neither can `ps`.
+
+#### Reading the registry directly
+
+Each running server writes `~/.tokensave/servers/<pid>.json`. Wrappers should
+read these files rather than shelling out; `tokensave servers --json` emits the
+same objects.
+
+```json
+{
+  "pid": 87904,
+  "started_at": 1788099755,
+  "project_path": "/Users/you/Code/app",
+  "argv_path": "/Users/you/Code/app",
+  "db_path": "/Users/you/Code/app/.tokensave/tokensave.db",
+  "version": "7.11.0"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `pid` | OS process id; also the filename stem |
+| `started_at` | Process start time, Unix epoch seconds, as the OS reports it. With `pid` this survives PID reuse |
+| `project_path` | The project root the server resolved and is serving |
+| `argv_path` | The root as given on the command line, or `null` when the host supplied it another way |
+| `db_path` | The database actually held open — **match on this** for the index → process direction |
+| `version` | The tokensave version serving, so a stale binary is visible |
+
+The registry lives in the global directory rather than beside the index on
+purpose: a PID file inside `.tokensave/` would sit in the one directory whose
+defining problem is that it cannot be deleted, and would vanish with the
+checkout being cleaned up.
+
+Entries are removed on clean exit. A hard kill skips that, so stale entries are
+also reaped whenever a server starts and whenever the registry is read — an
+entry never outlives one listing.
+
+#### There is no `servers --stop`
+
+Stopping is deliberately left to you. MCP clients restart their servers, so
+"stop them all" does not converge: new processes appear while old ones are
+being killed. Terminating is only safe for someone who knows whether the host
+is running and can stop it first, which tokensave cannot know. Identify the
+holder here, then stop the client — or kill that one PID, which `serve` now
+honours (a `SIGTERM` used to be ignored; fixed in #436/#450).
 
 ### Strict mode: refuse worktree content mismatches
 

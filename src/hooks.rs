@@ -27,8 +27,8 @@ const MAX_PATTERN_LEN: usize = 200;
 const CODE_EXTENSIONS: &[&str] = &[
     // Lite tier
     "rs", "go", "java", "scala", "sc", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py",
-    "pyi", "pyw", "c", "h", "cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "ipp", "tcc",
-    "kt", "kts", "cs", "csx", "swift", // Medium tier
+    "pyi", "pyw", "c", "h", "cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "inl", "ipp",
+    "tcc", "kt", "kts", "cs", "csx", "swift", // Medium tier
     "dart", "pas", "pp", "dpr", "php", "phtml", "rb", "rake", "gemspec", "sh", "bash", "zsh",
     "proto", "ps1", "psm1", "psd1", "nix", "vb", "vbs", // Full tier
     "lua", "zig", "m", "mm", "pl", "pm", "bat", "cmd", "f", "f90", "f95", "f03", "for", "ftn",
@@ -158,6 +158,11 @@ enum PatternShape {
     WordBoundary,
     /// Multiple identifiers joined by `|` (or `\|` in BRE).
     Alternation,
+    /// A definition-anchored spelling of a single symbol — a leading
+    /// `def`/`class`/`fn`/… keyword, a trailing `(`, or both (#452). The
+    /// grepper is looking for where the symbol is *declared*, which is
+    /// precisely `tokensave_search`.
+    Definition,
 }
 
 /// `PreToolUse` hook handler for Claude Code's Agent / Grep / Bash matchers.
@@ -352,7 +357,7 @@ fn evaluate_grep_tool_input(parsed: &Value, env: &HookEnv) -> Option<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let ty = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if !target_looks_like_code(path, glob, ty, env) {
+    if !target_looks_like_code(path, &[glob], ty, env) {
         return None;
     }
     let shape = classify_symbol_pattern(pattern)?;
@@ -360,10 +365,135 @@ fn evaluate_grep_tool_input(parsed: &Value, env: &HookEnv) -> Option<String> {
 }
 
 /// Inspect a `Bash` tool command. Returns `Some(reason)` to redirect.
+/// Commands whose only effect is output. Anything not listed is treated as
+/// side-effecting, so an unrecognized command means the batch is left alone.
+///
+/// `before_search` distinguishes the two positions `true` and `:` appear in.
+/// Ahead of the search they carry nothing, so `true; grep -n Sym src/lib.rs`
+/// is a batched search. *After* it they are consuming the search's exit
+/// status — `grep -n Sym src/lib.rs || true` is the error-suppression idiom
+/// #475/#476 pin as pass-through, so they are not inert there.
+fn is_inert_command(segment: &str, before_search: bool) -> bool {
+    // Deliberately short and conservative: anything unrecognised counts as
+    // having side effects, so the unknown case allows rather than eating work.
+    const INERT: [&str; 5] = ["echo", "pwd", "ls", "cat", "printf"];
+    const EXIT_STATUS_ONLY: [&str; 2] = ["true", ":"];
+    let rest = strip_command_prefixes(segment.trim()).rest;
+    let head = rest.split_whitespace().next().unwrap_or("");
+    INERT.contains(&head) || (before_search && EXIT_STATUS_ONLY.contains(&head))
+}
+
+/// Split a command on top-level `&&`, `||` and `;`, keeping each segment
+/// verbatim so it can be re-classified on its own.
+///
+/// Returns `None` for a single segment, for unbalanced quotes, and for the
+/// shapes this hook deliberately does not model: subshells, command
+/// substitution, newlines, pipes, redirects and background jobs. Not modeled means not
+/// blocked — the caller falls through and allows.
+fn split_top_level_segments(command: &str) -> Option<Vec<&str>> {
+    // Command substitution is unmodeled wherever it sits, and quoting does not
+    // make it inert: `echo "$(curl -X POST …)"` runs the POST. The scan below
+    // skips quoted spans, so this has to be caught before it starts.
+    // A newline separates commands just like `;` does, but the segment scan
+    // below does not split on it, so an embedded newline would hide real work
+    // inside a segment that looks inert from its first word.
+    if command.contains("$(") || command.contains('`') || command.contains('\n') {
+        return None;
+    }
+
+    let mut segments: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if c == '\\' {
+                chars.next();
+            } else if c == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            // Matches has_chained_command: on Windows a backslash is a path separator,
+            // not an escape, so consuming the next char there would desynchronise the
+            // two scanners on the same line.
+            '\\' if !cfg!(windows) => {
+                chars.next();
+            }
+            '(' | ')' | '`' | '<' | '>' => return None,
+            // A lone `&` backgrounds and a lone `|` pipes; only the doubled
+            // forms are sequencing operators.
+            '&' | '|' => {
+                if chars.peek().map(|&(_, next)| next) != Some(c) {
+                    return None;
+                }
+                chars.next();
+                segments.push(&command[start..i]);
+                start = i + 2;
+            }
+            ';' => {
+                segments.push(&command[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+    segments.push(&command[start..]);
+
+    let segments: Vec<&str> = segments
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        None
+    } else {
+        Some(segments)
+    }
+}
+
 fn evaluate_bash_command(command: &str, env: &HookEnv) -> Option<String> {
     if !env.in_tokensave_project || env.disable_grep_hook {
         return None;
     }
+    // The whole command first. This is the only path that models a leading
+    // `cd`, which segment splitting would otherwise read as a side-effecting
+    // command and allow.
+    if let Some(reason) = evaluate_bash_segment(command, env) {
+        return Some(reason);
+    }
+    // #451: batching a search behind other commands is an ordinary shape, not
+    // an attempt to slip past the hook. Redirect the search only when every
+    // other segment is inert, so a denial can never discard real work.
+    let segments = split_top_level_segments(command)?;
+    let mut reason = None;
+    for segment in &segments {
+        if let Some(found) = evaluate_bash_segment(segment, env) {
+            reason.get_or_insert(found);
+        } else if !is_inert_command(segment, reason.is_none()) {
+            return None;
+        }
+    }
+    reason
+}
+
+/// Classify one command that carries no top-level sequencing operators.
+fn evaluate_bash_segment(command: &str, env: &HookEnv) -> Option<String> {
     // An explicit inline `TOKENSAVE_DISABLE_GREP_HOOK=<truthy>` opts out too, so
     // the deliberate bypass is honored rather than stripped and then blocked.
     let stripped = strip_command_prefixes(command.trim());
@@ -407,7 +537,13 @@ fn evaluate_bash_command(command: &str, env: &HookEnv) -> Option<String> {
         } else {
             Cow::Borrowed(target)
         };
-    if !target_looks_like_code(target.as_ref(), "", "", env) {
+    let globs: Vec<&str> = inv.globs.iter().map(String::as_str).collect();
+    if !target_looks_like_code(
+        target.as_ref(),
+        &globs,
+        inv.ty.as_deref().unwrap_or(""),
+        env,
+    ) {
         return None;
     }
     let shape = classify_symbol_pattern(&inv.pattern)?;
@@ -470,7 +606,7 @@ fn evaluate_find_command(command: &str, env: &HookEnv) -> Option<String> {
     if !targets.is_empty()
         && !targets
             .iter()
-            .all(|target| target_looks_like_code(target, "", "", env))
+            .all(|target| target_looks_like_code(target, &[], "", env))
     {
         return None;
     }
@@ -517,7 +653,7 @@ fn evaluate_glob_tool_input(parsed: &Value, env: &HookEnv) -> Option<String> {
         return None;
     }
     let path = parsed.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    if !target_looks_like_code(path, "", "", env) {
+    if !target_looks_like_code(path, &[], "", env) {
         return None;
     }
     Some(files_redirect_message("Glob", pattern))
@@ -539,6 +675,7 @@ fn redirect_message(tool_label: &str, pattern: &str, shape: PatternShape) -> Str
         PatternShape::BareSymbol | PatternShape::WordBoundary => {
             "tokensave_search (definition) or tokensave_callers_for (usages)"
         }
+        PatternShape::Definition => "tokensave_search (definition)",
         PatternShape::Alternation => {
             "tokensave_signature_search (multiple names at once) or repeated tokensave_search calls"
         }
@@ -569,13 +706,84 @@ fn classify_symbol_pattern(pattern: &str) -> Option<PatternShape> {
     let normalized = p.replace("\\|", "|");
     let parts: Vec<&str> = normalized.split('|').collect();
     if !parts.iter().all(|s| is_pure_identifier(s)) {
-        return None;
+        // Not a bare identifier (or alternation of them). Before passing it
+        // through, check whether it is the idiomatic way to grep for a
+        // *definition* — `def foo`, `class MyError`, `foo(` (#452). Those are
+        // the highest-value redirects, not the least: the intent is exactly a
+        // declaration lookup.
+        return classify_definition_pattern(p);
     }
 
     match (parts.len(), had_wb) {
         (1, true) => Some(PatternShape::WordBoundary),
         (1, false) => Some(PatternShape::BareSymbol),
         _ => Some(PatternShape::Alternation),
+    }
+}
+
+/// Definition-anchor keywords that may precede a symbol name in a grep pattern.
+/// Deliberately short and language-idiomatic: each one is a *declaration*
+/// keyword, so what follows it is a name being defined, never arbitrary prose.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "def",
+    "class",
+    "fn",
+    "func",
+    "function",
+    "struct",
+    "enum",
+    "trait",
+    "interface",
+    "impl",
+    "type",
+    "module",
+    "package",
+];
+
+/// Recognize a definition-anchored spelling of a single symbol: an optional
+/// leading declaration keyword, the identifier, and an optional trailing `(`.
+///
+/// Conservative by construction — exactly one identifier may survive the strip,
+/// and anything else left over (extra words, regex metacharacters, a trailing
+/// `)`, an argument list) returns `None` so the call passes through.
+fn classify_definition_pattern(pattern: &str) -> Option<PatternShape> {
+    let mut rest = pattern.trim();
+    // Anchors are noise for this purpose: `^def foo` is the same intent.
+    rest = rest.strip_prefix('^').unwrap_or(rest);
+    rest = rest.trim_start();
+
+    let mut had_keyword = false;
+    let mut had_paren = false;
+    for kw in DEFINITION_KEYWORDS {
+        if let Some(tail) = rest.strip_prefix(kw) {
+            // Require real separation, so `defaults` is not read as `def aults`.
+            if tail.starts_with(|c: char| c.is_whitespace()) {
+                rest = tail.trim_start();
+                had_keyword = true;
+                break;
+            }
+        }
+    }
+
+    // A trailing `(` (bare or escaped) marks a call or definition site.
+    if let Some(head) = rest.strip_suffix('(') {
+        rest = head.strip_suffix('\\').unwrap_or(head);
+        had_paren = true;
+    }
+    rest = rest.trim_end();
+
+    // Without an anchor there is nothing here the bare-identifier path did not
+    // already reject.
+    if !(had_keyword || had_paren) || !is_pure_identifier(rest) {
+        return None;
+    }
+    // A declaration keyword pins the intent to the definition. A bare trailing
+    // paren does not — `foo(` is as often a hunt for call sites — so it gets
+    // the same both-ways suggestion a bare identifier gets.
+    if had_keyword {
+        Some(PatternShape::Definition)
+    } else {
+        Some(PatternShape::BareSymbol)
     }
 }
 
@@ -594,18 +802,36 @@ fn is_pure_identifier(s: &str) -> bool {
 ///
 /// Conservative: when the answer is ambiguous we return `false` so the call
 /// passes through unchanged.
-fn target_looks_like_code(path: &str, glob: &str, ty: &str, env: &HookEnv) -> bool {
+fn target_looks_like_code(path: &str, globs: &[&str], ty: &str, env: &HookEnv) -> bool {
     // When a concrete path is provided, it must resolve inside the indexed
     // project for the guardrail to apply. Greps targeting other directories
     // (e.g. /tmp, another repo) are not tokensave's concern.
     // Skip when project_root is unknown (tests, edge cases): fall through to
     // the original classification rules.
+    // Set when the target is known to resolve inside the indexed tree. That is
+    // a stronger signal than any name-based rule, so it overrides the
+    // directory-basename fallback further down (#452).
+    let mut known_inside = false;
     if !path.is_empty() && env.project_root.is_some() {
         let raw = path.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
         match classify_path_within_project(raw, env.project_root.as_deref()) {
             Containment::Outside => return false,
-            // Inside or Unknown: keep the existing extension / directory rules.
-            Containment::Inside | Containment::Unknown => {}
+            // Inside the tree is not the same as inside the index. A path
+            // under one of the project's own `exclude` globs — `node_modules`,
+            // `vendor`, `build`, `target` — is never indexed, so the tools
+            // this guardrail redirects to cannot answer for it, and blocking
+            // the grep costs a round-trip through the opt-out for a query
+            // nothing else can serve (#448). Same shape as #435, which fixed
+            // the out-of-tree half; the indexer and the hook were reading two
+            // different notions of "in scope".
+            Containment::Inside => {
+                if path_is_config_excluded(raw, env.project_root.as_deref()) {
+                    return false;
+                }
+                known_inside = true;
+            }
+            // Unknown: keep the existing extension / directory rules.
+            Containment::Unknown => {}
         }
     }
 
@@ -613,11 +839,26 @@ fn target_looks_like_code(path: &str, glob: &str, ty: &str, env: &HookEnv) -> bo
         return CODE_TYPE_FILTERS.contains(&ty.to_ascii_lowercase().as_str());
     }
 
-    if let Some(glob_is_code) = classify_glob_target(glob) {
-        return glob_is_code;
+    // A search narrowed to a file set is answered by that set, not by the root
+    // the walk starts from. When several globs are given, one non-code member
+    // is enough to pass the whole search through: the graph cannot answer for
+    // it, so blocking costs a round-trip through the opt-out for nothing.
+    let glob_verdicts: Vec<bool> = globs
+        .iter()
+        .filter_map(|g| classify_glob_target(g))
+        .collect();
+    if glob_verdicts.iter().any(|is_code| !is_code) {
+        return false;
+    }
+    if !glob_verdicts.is_empty() {
+        return true;
     }
 
-    let raw = if path.is_empty() { glob } else { path };
+    let raw = if path.is_empty() {
+        globs.first().copied().unwrap_or("")
+    } else {
+        path
+    };
     let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
     if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
         return true;
@@ -650,14 +891,74 @@ fn target_looks_like_code(path: &str, glob: &str, ty: &str, env: &HookEnv) -> bo
         }
     }
 
-    // No extension — treat as a directory. Block only when the last path
-    // component is a recognized code root.
+    // No extension — treat as a directory. When the path already resolved
+    // inside the indexed tree and survived the exclude globs, that *is* the
+    // answer: the directory holds indexed files whatever it is called, and a
+    // name list can only get it wrong (#452 — `mypkg/`, `core/`, `api/` are
+    // ordinary source roots). The basename list stays as the fallback for a
+    // target we could not resolve, where a name is all we have.
+    if known_inside && dir_holds_code_files(trimmed) {
+        return true;
+    }
     let last = trimmed
         .trim_end_matches(std::path::is_separator)
         .rsplit(std::path::is_separator)
         .next()
         .unwrap_or("");
     CODE_DIRS.contains(&last)
+}
+
+/// How many directory entries `dir_holds_code_files` will look at before
+/// giving up. A hook runs on every tool call, so the walk has to be bounded;
+/// exhausting the budget answers "no" and the caller falls through to the
+/// name-based rule, which is the pre-existing behaviour.
+const CODE_FILE_SCAN_BUDGET: usize = 2_000;
+
+/// Does this directory actually contain source files the index would hold?
+///
+/// The name of a directory is a poor proxy for what is in it (#452): `mypkg/`,
+/// `core/` and `api/` are ordinary source roots, while `docs/` inside the same
+/// project is not. Answer from the contents instead, breadth-first and
+/// bounded, stopping at the first file with a known code extension. Hidden
+/// directories are skipped — they are not indexed, and descending into `.git`
+/// would burn the whole budget for nothing.
+fn dir_holds_code_files(path: &str) -> bool {
+    let start = PathBuf::from(path);
+    if start.is_file() {
+        return true;
+    }
+    let mut queue = std::collections::VecDeque::from([start]);
+    let mut seen = 0usize;
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > CODE_FILE_SCAN_BUDGET {
+                return false;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => queue.push_back(entry.path()),
+                Ok(ft) if ft.is_file() => {
+                    let ext = name
+                        .rsplit_once('.')
+                        .map(|(_, e)| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if !ext.is_empty() && CODE_EXTENSIONS.contains(&ext.as_str()) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Result of asking whether a path lies inside the indexed project root.
@@ -707,6 +1008,60 @@ fn classify_path_containment_with_home(
         }
         _ => Containment::Unknown,
     }
+}
+
+/// True when `raw` resolves to a path the project's own `.tokensave/config.json`
+/// excludes from indexing (#448).
+///
+/// Read straight from the project's config so the hook and the indexer share
+/// one definition of what is in scope, rather than the hook keeping a second
+/// list that can drift. A config that cannot be read answers `false`, leaving
+/// the caller's existing rules in charge — the same fail-open policy
+/// [`classify_path_containment_with_home`] applies to a path it cannot
+/// resolve.
+fn path_is_config_excluded(raw: &str, project_root: Option<&Path>) -> bool {
+    let Some(root) = project_root else {
+        return false;
+    };
+    let Ok(config) = crate::config::load_config(root) else {
+        return false;
+    };
+    path_is_config_excluded_with(raw, root, &config, crate::agents::home_dir().as_deref())
+}
+
+/// [`path_is_config_excluded`] with the config and home directory injected, so
+/// tests need neither a config file on disk nor a mutated environment.
+fn path_is_config_excluded_with(
+    raw: &str,
+    root: &Path,
+    config: &crate::config::TokenSaveConfig,
+    home: Option<&Path>,
+) -> bool {
+    let Some(target) = expand_home_prefix(raw, home) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        root.join(target)
+    };
+    let (Ok(target), Ok(root)) = (resolved.canonicalize(), root.canonicalize()) else {
+        return false;
+    };
+    let Ok(relative) = target.strip_prefix(&root) else {
+        return false;
+    };
+    // Exclude globs are written with forward slashes regardless of platform,
+    // matching how the scanner spells the paths it tests them against.
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if relative.is_empty() {
+        return false;
+    }
+    // A grep target is as likely to be a directory as a file, and the two
+    // glob spellings (`vendor/**` and `**/vendor`) are matched by different
+    // helpers, so ask both.
+    crate::config::is_excluded(&relative, config)
+        || crate::config::is_excluded_dir(&relative, config)
 }
 
 fn classify_path_within_project(raw: &str, project_root: Option<&Path>) -> Containment {
@@ -815,10 +1170,16 @@ fn classify_glob_target(glob: &str) -> Option<bool> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct GrepInvocation {
     pattern: String,
     targets: Vec<String>,
+    /// File globs the search was narrowed to: grep's `--include`, rg/ag's
+    /// `-g`/`--glob`/`--iglob`. An include glob is more specific evidence than
+    /// the search root, exactly as the native `Grep` tool's `glob` field is.
+    globs: Vec<String>,
+    /// rg/ag's `-t`/`--type` file-type filter, if given.
+    ty: Option<String>,
 }
 
 /// A `find`/`fd` invocation reduced to what the policy needs: the name globs
@@ -829,6 +1190,63 @@ struct FindInvocation {
     globs: Vec<String>,
     /// Search roots, in command order. Empty means the default (`.`).
     targets: Vec<String>,
+}
+
+/// True when `command` carries work beyond the search itself — a top-level
+/// `&&`, `||`, `;`, `|`, backgrounding `&`, a command substitution (`$(…)` or
+/// backticks), or an output redirect — outside of single quotes.
+///
+/// A search is only ever a *suggestion* to use the graph instead, so it must
+/// never be allowed to veto a command it does not fully model. When the line
+/// carries anything else, denying it discards that other work — a
+/// `./deploy.sh` that never runs is a far worse failure than a grep that was
+/// not redirected (#475). The parsers that follow assume the whole line
+/// belongs to the search they matched, so anything else on it makes that
+/// assumption false and the command passes through untouched.
+///
+/// `2>`/`2>>` is the exception: it only discards the search's own stderr, so
+/// the line still *is* just the search and stays deniable (#480).
+fn has_chained_command(command: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if c == '\\' {
+                chars.next();
+            } else if c == '"' {
+                in_double = false;
+            } else if c == '`' || (c == '$' && chars.peek() == Some(&'(')) {
+                // Substitutions still run inside double quotes.
+                return true;
+            }
+        } else {
+            match c {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '\\' if !cfg!(windows) => {
+                    chars.next();
+                }
+                '$' if chars.peek() == Some(&'(') => return true,
+                // Consume `2>` / `2>>` before the redirect arm sees it: routing
+                // the search's own stderr away leaves nothing for a denial to
+                // discard, so it is still fully modeled.
+                '2' if chars.peek() == Some(&'>') => {
+                    chars.next();
+                    if chars.peek() == Some(&'>') {
+                        chars.next();
+                    }
+                }
+                '&' | '|' | ';' | '`' | '>' => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Parse a bash command that *starts* with `find` or `fd`, after the same
@@ -842,13 +1260,13 @@ struct FindInvocation {
 /// not a glob, and guessing at one would block calls we cannot actually serve.
 fn extract_find_invocation(command: &str) -> Option<FindInvocation> {
     let rest = strip_command_prefixes(command.trim()).rest;
-    let (is_find, after_tool) = if let Some(after) = rest.strip_prefix("find ") {
-        (true, after)
-    } else if let Some(after) = rest.strip_prefix("fd ") {
-        (false, after)
-    } else {
+    if has_chained_command(rest) {
         return None;
-    };
+    }
+    let (is_find, after_tool) = rest
+        .strip_prefix("find ")
+        .map(|after| (true, after))
+        .or_else(|| rest.strip_prefix("fd ").map(|after| (false, after)))?;
 
     let mut inv = FindInvocation::default();
     let mut iter = shell_split(after_tool).into_iter().peekable();
@@ -911,6 +1329,11 @@ fn extract_find_invocation(command: &str) -> Option<FindInvocation> {
 /// search, so it deliberately passes through.
 fn extract_grep_invocation(command: &str) -> Option<GrepInvocation> {
     let rest = strip_command_prefixes(command.trim()).rest;
+    // A search chained to other work is not this command's whole story, and a
+    // denial would throw that other work away (#475).
+    if has_chained_command(rest) {
+        return None;
+    }
 
     // Identify the tool. `git grep` is intentionally excluded — it searches
     // git history, which tokensave does not index.
@@ -921,6 +1344,8 @@ fn extract_grep_invocation(command: &str) -> Option<GrepInvocation> {
     let tokens = shell_split(after_tool);
     let mut pattern: Option<String> = None;
     let mut targets: Vec<String> = Vec::new();
+    let mut globs: Vec<String> = Vec::new();
+    let mut ty: Option<String> = None;
     let mut iter = tokens.into_iter().peekable();
     while let Some(tok) = iter.next() {
         if tok.starts_with('-') {
@@ -932,6 +1357,37 @@ fn extract_grep_invocation(command: &str) -> Option<GrepInvocation> {
                 if pattern.is_none() {
                     pattern = Some(p.to_string());
                 }
+            // An include glob narrows the search to a file set, which is
+            // stronger evidence about what is being searched than the root the
+            // walk starts from: `grep -rn foo --include='*.md' .` is a docs
+            // search whatever `.` contains. Both spellings, and both the
+            // separate-token and `=`-joined forms.
+            } else if tok == "--include" || tok == "-g" || tok == "--glob" || tok == "--iglob" {
+                if let Some(g) = iter.next() {
+                    globs.push(g);
+                }
+            } else if let Some(g) = tok
+                .strip_prefix("--include=")
+                .or_else(|| tok.strip_prefix("--glob="))
+                .or_else(|| tok.strip_prefix("--iglob="))
+            {
+                globs.push(g.to_string());
+            } else if tok == "-t" || tok == "--type" {
+                // First filter wins, mirroring the single `type` field the
+                // native `Grep` tool carries.
+                if let Some(t) = iter.next() {
+                    ty.get_or_insert(t);
+                }
+            } else if let Some(t) = tok.strip_prefix("--type=") {
+                ty.get_or_insert(t.to_string());
+            // Value-taking flags whose argument is not a glob. Consuming the
+            // value keeps it from being misread as the pattern or a target.
+            } else if tok == "--exclude"
+                || tok == "--exclude-dir"
+                || tok == "-T"
+                || tok == "--type-not"
+            {
+                iter.next();
             }
             continue;
         }
@@ -945,6 +1401,8 @@ fn extract_grep_invocation(command: &str) -> Option<GrepInvocation> {
     Some(GrepInvocation {
         pattern: pattern?,
         targets,
+        globs,
+        ty,
     })
 }
 

@@ -225,7 +225,7 @@ fn lang_from_path(path: &str) -> &'static str {
         "kt" | "kts" => "kotlin",
         "swift" => "swift",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "inl" | "ipp" | "tcc" => "cpp",
         "cs" => "csharp",
         "rb" => "ruby",
         "php" => "php",
@@ -239,6 +239,23 @@ fn lang_from_path(path: &str) -> &'static str {
         "proto" => "proto",
         _ => "unknown",
     }
+}
+
+/// A `.cpp` calling into its own `.h` tags differently, and without this the match takes 0.5, under
+/// the 0.6 floor in [`Resolver::resolve_all`], and the edge is dropped.
+fn same_language_family(a: &str, b: &str) -> bool {
+    a == b || matches!((a, b), ("c", "cpp") | ("cpp", "c"))
+}
+
+fn is_c_family(lang: &str) -> bool {
+    matches!(lang, "c" | "cpp")
+}
+
+fn is_header_path(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next().unwrap_or(""),
+        "h" | "hpp" | "hxx" | "hh" | "inl" | "ipp" | "tcc"
+    )
 }
 
 /// Count shared path segments between two file paths.
@@ -321,6 +338,10 @@ pub struct ReferenceResolver<'a> {
     /// Bug 1).
     go_import_qualifiers: HashMap<String, HashMap<String, String>>,
 }
+
+/// References paired with their position in the slice `resolve_all` was given,
+/// so a failure can be reported by index rather than by an owned copy (#483).
+type IndexedRefs<'r> = Vec<(usize, &'r UnresolvedRef)>;
 
 impl<'a> ReferenceResolver<'a> {
     /// Creates a resolver from pre-loaded nodes.
@@ -553,7 +574,57 @@ impl<'a> ReferenceResolver<'a> {
     /// turning hopeless lookups into O(1) hash checks.
     pub fn resolve_all(&self, refs: &[UnresolvedRef]) -> ResolutionResult {
         let total = refs.len();
+        let (mut resolved, ambiguous, unresolved) = self.resolve_batch_inner(refs);
+        self.finalize_resolved(&mut resolved);
+        let resolved_count = resolved.len();
+        ResolutionResult {
+            resolved,
+            unresolved,
+            total,
+            resolved_count,
+            ambiguous,
+        }
+    }
 
+    /// Resolve one batch of references, without the cross-batch finishing step.
+    ///
+    /// For callers streaming the reference table rather than materialising it
+    /// (#482). Every reference resolves independently against the whole index
+    /// — `resolve_batch_inner` is a `par_iter().map(resolve_one)` — so the
+    /// index stays global and only the *input* is chunked. That is why this is
+    /// safe where chunking the node slice is not: a chunked name index would
+    /// silently lose targets defined outside the chunk, but a chunked input
+    /// cannot lose anything.
+    ///
+    /// The caller must run [`Self::finalize_resolved`] once over the
+    /// accumulated results before creating edges.
+    pub fn resolve_batch(&self, refs: &[UnresolvedRef]) -> (Vec<ResolvedRef>, Vec<AmbiguousCall>) {
+        let (resolved, ambiguous, _) = self.resolve_batch_inner(refs);
+        (resolved, ambiguous)
+    }
+
+    /// The one step that cannot be done per batch.
+    ///
+    /// A Go selector call emits both a selector ref and a bare-name sibling at
+    /// the same site; once the selector resolves via its import path the
+    /// sibling only adds a phantom name-tie edge (#153 Bug 1). Both members of
+    /// such a pair come from the same call site and so from the same file, but
+    /// nothing guarantees they land in the same batch, so this runs once over
+    /// the accumulated set.
+    pub fn finalize_resolved(&self, resolved: &mut Vec<ResolvedRef>) {
+        suppress_go_selector_bare_siblings(resolved);
+    }
+
+    /// Resolve `refs`, returning the resolved edges, the ambiguity records, and
+    /// the input positions that did not resolve.
+    ///
+    /// Ambiguity is derived before the Go suppression, as it always was: a
+    /// suppressed sibling is a resolution that is deliberately dropped, not a
+    /// failure to explain.
+    fn resolve_batch_inner(
+        &self,
+        refs: &[UnresolvedRef],
+    ) -> (Vec<ResolvedRef>, Vec<AmbiguousCall>, Vec<u32>) {
         // Partition into resolvable (name exists in graph) and hopeless.
         //
         // A qualified/dotted ref (`Self::method`, `Type::method`, `obj.method`)
@@ -564,46 +635,50 @@ impl<'a> ReferenceResolver<'a> {
         // ever ran. That silently lost all `Self::`/`Type::` and Python/TS
         // dotted-method call edges (#141). Also admit a ref when its trailing
         // simple name is known.
-        let (candidates, hopeless): (Vec<_>, Vec<_>) = refs.iter().partition(|uref| {
-            self.is_known_name(&uref.reference_name)
-                || self.is_known_name(simple_ref_name(&uref.reference_name))
-        });
+        //
+        // Carried with their input positions, so a reference that fails can be
+        // reported by index instead of by an owned copy (#483).
+        let (candidates, hopeless): (IndexedRefs<'_>, IndexedRefs<'_>) =
+            refs.iter().enumerate().partition(|(_, uref)| {
+                self.is_known_name(&uref.reference_name)
+                    || self.is_known_name(simple_ref_name(&uref.reference_name))
+            });
 
         let results: Vec<_> = candidates
             .par_iter()
-            .map(|uref| (*uref, self.resolve_one(uref)))
+            .map(|(i, uref)| (*i, *uref, self.resolve_one(uref)))
             .collect();
 
         let mut resolved = Vec::new();
-        let mut unresolved: Vec<UnresolvedRef> = hopeless.into_iter().cloned().collect();
-        for (uref, res) in results {
+        // Borrowed, not cloned. This used to build a `Vec<UnresolvedRef>` by
+        // cloning every reference that failed — ~160,000 owned records per
+        // sync on tokensave's own tree, several `String`s each, to populate a
+        // field nothing in the product reads (#483).
+        let mut failed: IndexedRefs<'_> = hopeless;
+        for (i, uref, res) in results {
             match res {
                 Some(r) if r.confidence >= 0.6 => resolved.push(r),
-                Some(_) | None => unresolved.push(uref.clone()), // below confidence floor or unresolved
+                Some(_) | None => failed.push((i, uref)), // below confidence floor or unresolved
             }
         }
 
-        // #153 Bug 1: a Go selector call emits both a selector ref and a
-        // bare-name sibling at the same site. Once the selector resolves via
-        // its import path, the sibling only adds a phantom name-tie edge — drop
-        // it so a package-qualified call yields exactly one correct edge.
-        suppress_go_selector_bare_siblings(&mut resolved);
-
-        let resolved_count = resolved.len();
-
         // Why each remaining ref failed, where the reason was a tie (#412).
-        let ambiguous: Vec<AmbiguousCall> = unresolved
+        let ambiguous: Vec<AmbiguousCall> = failed
             .iter()
-            .filter_map(|uref| self.explain_ambiguity(uref))
+            .filter_map(|(_, uref)| self.explain_ambiguity(uref))
             .collect();
 
-        ResolutionResult {
-            resolved,
-            unresolved,
-            total,
-            resolved_count,
-            ambiguous,
-        }
+        // Input order, which the old field was not: it listed the references
+        // rejected by the name pre-filter first, then those that failed
+        // resolution, so its order depended on the partition rather than on
+        // the caller's slice.
+        let mut unresolved: Vec<u32> = failed
+            .iter()
+            .map(|(i, _)| u32::try_from(*i).unwrap_or(u32::MAX))
+            .collect();
+        unresolved.sort_unstable();
+
+        (resolved, ambiguous, unresolved)
     }
 
     /// Converts a slice of resolved references into graph edges.
@@ -872,7 +947,7 @@ impl<'a> ReferenceResolver<'a> {
             let candidate_lang = lang_from_path(&candidates[0].file_path);
             let confidence = if ref_lang != "unknown"
                 && candidate_lang != "unknown"
-                && ref_lang != candidate_lang
+                && !same_language_family(ref_lang, candidate_lang)
             {
                 0.5
             } else {
@@ -952,7 +1027,7 @@ impl<'a> ReferenceResolver<'a> {
             let candidate_lang = lang_from_path(&candidates[0].file_path);
             let confidence = if ref_lang != "unknown"
                 && candidate_lang != "unknown"
-                && ref_lang != candidate_lang
+                && !same_language_family(ref_lang, candidate_lang)
             {
                 0.5
             } else {
@@ -1016,11 +1091,18 @@ impl<'a> ReferenceResolver<'a> {
         // Language matching
         let candidate_lang = lang_from_path(&node.file_path);
         if ref_lang != "unknown" && candidate_lang != "unknown" {
-            if ref_lang == candidate_lang {
+            if same_language_family(ref_lang, candidate_lang) {
                 score += 50;
             } else {
                 score -= 80;
             }
+        }
+
+        // Header declares, source defines, a caller wants the body; small enough that directory
+        // proximity still decides between two definitions.
+        if is_c_family(ref_lang) && is_c_family(candidate_lang) && !is_header_path(&node.file_path)
+        {
+            score += 20;
         }
 
         // Exported / pub bonus

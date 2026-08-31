@@ -298,6 +298,10 @@ impl TokenSave {
         // `begin_bulk_load` can fail while another process holds the table
         // lock, and clearing first would leave the project with an empty index
         // that the MCP server then keeps serving (#320).
+        // Before the destructive step, not after: `clear()` empties the index
+        // and a shutdown observed a moment later would leave nothing to serve
+        // until the next sync. Leaving here costs the caller nothing (#450).
+        crate::cancel::check("index")?;
         self.db.begin_bulk_load().await?;
         self.db.clear().await?;
 
@@ -321,6 +325,10 @@ impl TokenSave {
         let (files, artifact_files) = Self::partition_artifacts(files, &self.artifact_extensions());
         let (extractions, _skipped) =
             extract_files_isolated(&project_root, registry, files.clone());
+        // Extraction stops early on a shutdown, so a short result here means
+        // abandoned work, not an empty project. Committing it would write a
+        // partial graph that looks complete.
+        crate::cancel::check("index")?;
 
         // 4. Collect all data
         let mut all_nodes = Vec::new();
@@ -393,13 +401,20 @@ impl TokenSave {
         // 5. Resolve references in-memory (parallel) before DB insert
         let phase_start = Instant::now();
         crate::memstats::set_graph_nodes(all_nodes.len() as u64);
+        // Last point before anything is written in the full-index path: the
+        // inserts all happen after resolution, so leaving here still commits
+        // nothing (#450). Resolution itself is a single whole-graph pass with
+        // no safe interior seam, hence the check in front of it rather than
+        // inside it.
+        crate::cancel::check("index")?;
         if !all_unresolved.is_empty() {
             // #253: `from_nodes` borrows from `all_nodes` rather than
             // cloning it into its caches; the remaining peak here is
             // `all_nodes` itself (#306).
-            crate::memstats::record("index:resolve:build_caches");
             let resolver = ReferenceResolver::from_nodes(&self.db, &all_nodes);
+            crate::memstats::record("index:resolve:build_caches");
             let resolution = resolver.resolve_all(&all_unresolved);
+            crate::memstats::record("index:resolve:refs");
             // Ties are recorded rather than dropped, so a caller can pick the
             // intended target and `dead_code` can tell "referenced, target
             // unknown" from "uncalled" (#412).
@@ -595,6 +610,88 @@ impl TokenSave {
     /// it to release so the DB is fresh by the time the caller refreshes its
     /// view; if the peer covered our files, return without doing extra work,
     /// otherwise sync ourselves.
+    /// How many unresolved references to resolve at a time (#482).
+    ///
+    /// The whole table used to be materialised: 189,446 records and +74.6 MiB
+    /// on this repository, on every sync. 25,000 keeps that page under ~10 MiB
+    /// while making the paging overhead — one indexed query per page — a
+    /// rounding error against resolving the batch.
+    const RESOLVE_BATCH: usize = 25_000;
+
+    /// Resolve every unresolved reference, a page at a time (#482).
+    ///
+    /// The resolver's name index is built once and stays global; only the
+    /// input is paged. That is what makes this safe where chunking the *node*
+    /// slice is not — each reference resolves independently, so a page cannot
+    /// lose a target the way a chunked index would.
+    ///
+    /// What still accumulates is small and bounded by the *answers* rather than
+    /// the questions: on this repository 28,849 resolved and 11,713 ambiguity
+    /// records, against 189,446 inputs. The Go selector suppression runs once
+    /// over the accumulated set, since nothing guarantees a selector and its
+    /// bare-name sibling land in the same page.
+    async fn resolve_all_streamed(
+        &self,
+        resolver: &ReferenceResolver<'_>,
+    ) -> Result<(Vec<ResolvedRef>, Vec<AmbiguousCall>, usize)> {
+        let mut cursor = 0i64;
+        let mut resolved: Vec<ResolvedRef> = Vec::new();
+        let mut ambiguous: Vec<AmbiguousCall> = Vec::new();
+        let mut total = 0usize;
+
+        loop {
+            let page = self
+                .db
+                .get_unresolved_refs_after(cursor, Self::RESOLVE_BATCH)
+                .await?;
+            let Some((last_id, _)) = page.last() else {
+                break;
+            };
+            cursor = *last_id;
+            let refs: Vec<UnresolvedRef> = page.into_iter().map(|(_, r)| r).collect();
+            total += refs.len();
+            let (batch_resolved, batch_ambiguous) = resolver.resolve_batch(&refs);
+            resolved.extend(batch_resolved);
+            ambiguous.extend(batch_ambiguous);
+        }
+
+        resolver.finalize_resolved(&mut resolved);
+        Ok((resolved, ambiguous, total))
+    }
+
+    /// Re-propagate build-variant call edges without a whole-graph load (#481).
+    ///
+    /// The old shape loaded every `annotates` and `calls` edge — and did it
+    /// while the resolver's node slice was still alive, so two graph-sized
+    /// allocations were resident at once and the sync's peak RSS landed here.
+    /// On this repository that was 12.9 MiB and the run's high-water mark, to
+    /// emit **zero** edges: the grouping keeps 3 groups out of 19,331 nodes,
+    /// and a call has to point into one of them to propagate at all.
+    ///
+    /// The output set is small by construction, so ask SQL for it. Two bounded
+    /// queries — the variant groups, then only the `calls` edges targeting a
+    /// member — feed the same emitter the whole-graph path uses, so behaviour
+    /// is unchanged. The common case, no multi-member group, returns before
+    /// touching the edges table at all.
+    ///
+    /// Best-effort: a query failure yields no propagated edges rather than
+    /// failing the sync, matching the `unwrap_or_default()` this replaces.
+    async fn propagate_variant_edges_bounded(&self) -> Vec<Edge> {
+        let rust = self.db.variant_group_candidates().await.unwrap_or_default();
+        let go = self.db.go_variant_candidates().await.unwrap_or_default();
+        let groups = crate::resolution::variant_groups_from_candidates(&rust, &go);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let members: Vec<String> = groups
+            .values()
+            .flatten()
+            .map(|id| (*id).to_string())
+            .collect();
+        let edges = self.db.calls_edges_into(&members).await.unwrap_or_default();
+        crate::resolution::emit_variant_edges(&groups, &edges)
+    }
+
     pub async fn sync_if_stale_silent(&self, stale_files: &[String]) -> Result<()> {
         if stale_files.is_empty() {
             return Ok(());
@@ -734,6 +831,8 @@ impl TokenSave {
             self.db.insert_edges(&owned).await?;
         }
 
+        crate::cancel::check_partial("sync")?;
+
         // Resolve references for any new/changed unresolved refs
         if !file_paths.is_empty() {
             // #253: `from_nodes` borrows rather than clones. #306: the load
@@ -744,42 +843,41 @@ impl TokenSave {
             // resolver borrows from this slice for its whole life and needs
             // a global name index, so the pass cannot be chunked without a
             // redesign.
-            crate::memstats::record("sync:resolve:load_nodes");
+            // Samples are taken after the work they name; see the sibling
+            // site for why that matters (#409).
             let all_nodes = self
                 .db
                 .get_all_nodes_for_resolution()
                 .await
                 .unwrap_or_default();
             crate::memstats::set_graph_nodes(all_nodes.len() as u64);
-            crate::memstats::record("sync:resolve:build_caches");
+            crate::memstats::record("sync:resolve:load_nodes");
             let resolver = ReferenceResolver::from_nodes(&self.db, &all_nodes);
-            crate::memstats::record("sync:resolve:done");
-            let unresolved = self.db.get_unresolved_refs().await?;
-            if !unresolved.is_empty() {
-                let resolution = resolver.resolve_all(&unresolved);
+            crate::memstats::record("sync:resolve:build_caches");
+            // Paged rather than materialised (#482).
+            let (resolved_refs, ambiguous, total_refs) =
+                self.resolve_all_streamed(&resolver).await?;
+            crate::memstats::record("sync:resolve:refs");
+            if total_refs > 0 {
+                // The sync's peak lives between `resolve:done` and `sync:done`,
+                // and with no sample in that window it was attributed to
+                // whichever sample came next — which is why #409 was argued
+                // from `size_of` arithmetic rather than from RSS.
+                crate::memstats::record("sync:resolve:refs");
                 // See the full-index site: ambiguities are kept, not dropped.
                 let ambiguity_files: Vec<String> = self.scan_files();
                 let _ = self
                     .db
-                    .replace_ambiguous_calls(&ambiguity_files, &resolution.ambiguous)
+                    .replace_ambiguous_calls(&ambiguity_files, &ambiguous)
                     .await;
-                let edges = resolver.create_edges(&resolution.resolved);
+                let edges = resolver.create_edges(&resolved_refs);
                 if !edges.is_empty() {
                     self.db.insert_edges(&edges).await?;
-                    // Re-propagate build-variant call edges over the full graph
-                    // now that new call edges exist (#141).
-                    // Only the two kinds `propagate_variant_edges` reads, not
-                    // the whole table (#418). The `calls` half is irreducible
-                    // for this algorithm — any call into a variant member
-                    // matters — but type_of, returns, uses, implements, extends
-                    // and receives were all carried and never looked at.
-                    let all_db_edges = self
-                        .db
-                        .get_edges_by_kinds(&[EdgeKind::Annotates, EdgeKind::Calls])
-                        .await
-                        .unwrap_or_default();
-                    let variant_edges =
-                        crate::resolution::propagate_variant_edges(&all_nodes, &all_db_edges);
+                    // Re-propagate build-variant call edges now that new call
+                    // edges exist (#141), from the two bounded queries rather
+                    // than the whole graph (#481).
+                    let variant_edges = self.propagate_variant_edges_bounded().await;
+                    crate::memstats::record("sync:variants");
                     if !variant_edges.is_empty() {
                         self.db.insert_edges(&variant_edges).await?;
                     }
@@ -834,6 +932,7 @@ impl TokenSave {
         write_dirty_sentinel(&self.project_root);
         let start = Instant::now();
 
+        crate::cancel::check("sync")?;
         on_progress(0, 0, "scanning files");
         let phase_start = Instant::now();
         let (current_files, skipped_extensions) = self.scan_files_diagnostics();
@@ -861,6 +960,8 @@ impl TokenSave {
             file_stats.len(),
             phase_start.elapsed().as_secs_f64()
         ));
+
+        crate::cancel::check("sync")?;
 
         // Load all DB file records into a map for O(1) lookups
         let db_files = self.db.get_all_files().await?;
@@ -1034,6 +1135,10 @@ impl TokenSave {
         // so the user can see them in `tokensave sync --doctor`.
         skipped.extend(sync_skipped);
 
+        // Extraction is the long phase and stops early on a shutdown, so this
+        // is the last point at which nothing has been written yet (#450).
+        crate::cancel::check("sync")?;
+
         // Phase 1: insert all nodes (and metadata) so cross-file edges
         // can reference them. Edges are queued for phase 2 (#58).
         let total = sync_extractions.len();
@@ -1042,6 +1147,11 @@ impl TokenSave {
         let mut queued_edges: Vec<&Edge> = Vec::new();
         let mut body_documents = Vec::new();
         for (idx, (file_path, result, hash, size, mtime)) in sync_extractions.iter().enumerate() {
+            // Past this point rows are being written per file, so an
+            // interruption leaves a partially updated index rather than an
+            // untouched one — reported as such (#450). Checked per file
+            // because on a large tree this loop is minutes of work.
+            crate::cancel::check_partial("sync")?;
             on_progress(idx + 1, total, file_path);
 
             total_nodes += result.nodes.len();
@@ -1100,54 +1210,57 @@ impl TokenSave {
         if !to_index.is_empty() {
             on_progress(0, 0, "resolving references");
             let phase_start = Instant::now();
-            let unresolved = self.db.get_unresolved_refs().await?;
-            if !unresolved.is_empty() {
+            // Every sample here is taken *after* the work it names. They used
+            // to be taken before it, so each one reported the RSS of the
+            // previous step under the next step's name — which is how the
+            // whole-graph node load came to be blamed for 73 MiB that
+            // belonged to the reference load (#409).
+            let pending_refs = self.db.count_unresolved_refs().await.unwrap_or(0);
+            if pending_refs > 0 {
                 // #253: `from_nodes` borrows rather than clones. #306: the
                 // load drops `docstring` and `signature`, which resolution
                 // never reads and which are unbounded TEXT. The remaining
                 // peak is the node count itself — see the sibling site in
                 // the incremental path for why it cannot be chunked.
-                crate::memstats::record("sync:resolve:load_nodes");
                 let all_nodes = self
                     .db
                     .get_all_nodes_for_resolution()
                     .await
                     .unwrap_or_default();
                 crate::memstats::set_graph_nodes(all_nodes.len() as u64);
-                crate::memstats::record("sync:resolve:build_caches");
+                crate::memstats::record("sync:resolve:load_nodes");
                 let resolver = ReferenceResolver::from_nodes(&self.db, &all_nodes);
-                crate::memstats::record("sync:resolve:done");
-                let resolution = resolver.resolve_all(&unresolved);
+                crate::memstats::record("sync:resolve:build_caches");
+                // Paged rather than materialised (#482).
+                let (resolved_refs, ambiguous, _total_refs) =
+                    self.resolve_all_streamed(&resolver).await?;
+                crate::memstats::record("sync:resolve:refs");
+                // The sync's peak lives between `resolve:done` and `sync:done`,
+                // and with no sample in that window it was attributed to
+                // whichever sample came next — which is why #409 was argued
+                // from `size_of` arithmetic rather than from RSS.
+                crate::memstats::record("sync:resolve:refs");
                 // See the full-index site: ambiguities are kept, not dropped.
                 let ambiguity_files: Vec<String> = self.scan_files();
                 let _ = self
                     .db
-                    .replace_ambiguous_calls(&ambiguity_files, &resolution.ambiguous)
+                    .replace_ambiguous_calls(&ambiguity_files, &ambiguous)
                     .await;
-                let edges = resolver.create_edges(&resolution.resolved);
+                let edges = resolver.create_edges(&resolved_refs);
                 if !edges.is_empty() {
                     self.db.insert_edges(&edges).await?;
-                    // Propagate call edges across build-config variants (#141).
-                    // Only the two kinds `propagate_variant_edges` reads, not
-                    // the whole table (#418). The `calls` half is irreducible
-                    // for this algorithm — any call into a variant member
-                    // matters — but type_of, returns, uses, implements, extends
-                    // and receives were all carried and never looked at.
-                    let all_db_edges = self
-                        .db
-                        .get_edges_by_kinds(&[EdgeKind::Annotates, EdgeKind::Calls])
-                        .await
-                        .unwrap_or_default();
-                    let variant_edges =
-                        crate::resolution::propagate_variant_edges(&all_nodes, &all_db_edges);
+                    // Propagate call edges across build-config variants (#141),
+                    // from the two bounded queries rather than the whole graph
+                    // (#481).
+                    let variant_edges = self.propagate_variant_edges_bounded().await;
+                    crate::memstats::record("sync:variants");
                     if !variant_edges.is_empty() {
                         self.db.insert_edges(&variant_edges).await?;
                     }
                 }
             }
             on_verbose(&format!(
-                "resolved {} references in {:.1}s",
-                unresolved.len(),
+                "resolved {pending_refs} references in {:.1}s",
                 phase_start.elapsed().as_secs_f64()
             ));
         }
@@ -1830,10 +1943,11 @@ impl TokenSave {
             message: format!("failed to read file {file_path}: {e}"),
         })?;
 
-        let Some(extractor) = crate::project_manifest::resolve_extractor(
+        let Some(extractor) = crate::project_manifest::resolve_extractor_for_source(
             &self.registry,
             &self.project_root,
             file_path,
+            &source,
         ) else {
             return Ok(());
         };
