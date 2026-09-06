@@ -1,6 +1,6 @@
 [package]
 name = "tokensave"
-version = "7.11.0"
+version = "7.11.1"
 edition = "2021"
 description = "Code intelligence tool that builds a semantic knowledge graph from Rust, Go, Java, Scala, TypeScript, Python, C, C++, Kotlin, C#, Swift, and many more codebases"
 license = "MIT"
@@ -23,6 +23,29 @@ exclude = [
     ".worktrees/",
 ]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target-arch }-{ target-family }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-aarch64-macos.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-x86_64-linux.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-aarch64-linux.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-x86_64-windows.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-aarch64-windows.zip"
+pkg-fmt = "zip"
+
+
 [features]
 default = ["full"]
 
@@ -31,10 +54,10 @@ default = ["full"]
 lite = []
 
 medium = ["lang-dart", "lang-pascal", "lang-php", "lang-ruby", "lang-bash", "lang-protobuf", "lang-powershell", "lang-nix", "lang-vbnet"]
-full = ["medium", "lang-actionscript", "lang-lua", "lang-zig", "lang-objc", "lang-perl", "lang-batch", "lang-fortran", "lang-cobol", "lang-msbasic2", "lang-gwbasic", "lang-qbasic", "lang-dockerfile", "lang-glsl", "lang-wgsl", "lang-hlsl", "lang-metal", "lang-cuda", "lang-markdown", "lang-r", "lang-sql", "lang-julia", "lang-haskell", "lang-ocaml", "lang-clojure", "lang-erlang", "lang-elixir", "lang-fsharp", "lang-fstar", "lang-quint", "lang-toml", "lang-lean", "lang-gdscript", "lang-xaml", "lang-mcfunction", "lang-systemverilog", "lang-canvas"]
+full = ["medium", "lang-actionscript", "lang-lua", "lang-zig", "lang-objc", "lang-perl", "lang-batch", "lang-fortran", "lang-cobol", "lang-msbasic2", "lang-gwbasic", "lang-qbasic", "lang-dockerfile", "lang-glsl", "lang-wgsl", "lang-hlsl", "lang-metal", "lang-cuda", "lang-markdown", "lang-r", "lang-sql", "lang-julia", "lang-haskell", "lang-ocaml", "lang-clojure", "lang-erlang", "lang-elixir", "lang-fsharp", "lang-fstar", "lang-quint", "lang-toml", "lang-terraform", "lang-lean", "lang-gdscript", "lang-xaml", "lang-mcfunction", "lang-systemverilog", "lang-canvas", "lang-html", "lang-css"]
 
-# Language features (all grammars provided by tokensave-large-treesitters)
-# ActionScript uses a vendored grammar compiled by build.rs (not the bundle).
+# Language features (grammars come from tokensave-large-treesitters unless noted).
+# ActionScript is vendored; Terraform uses the direct tree-sitter-hcl dependency.
 lang-actionscript = []
 lang-dart = []
 lang-pascal = []
@@ -77,6 +100,9 @@ lang-fsharp = []
 lang-fstar = []
 lang-quint = []
 lang-toml = []
+lang-terraform = ["dep:tree-sitter-hcl"]
+lang-html = ["dep:tree-sitter-html"]
+lang-css = ["dep:tree-sitter-css"]
 lang-lean = []
 lang-gdscript = []
 lang-xaml = []
@@ -133,6 +159,9 @@ fs2 = "0.4"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 tree-sitter-hlsl = { version = "0.2.0", optional = true }
 tree-sitter-systemverilog = { version = "0.4", optional = true }
+tree-sitter-hcl = { version = "1.1", optional = true }
+tree-sitter-html = { version = "0.23", optional = true }
+tree-sitter-css = { version = "0.25", optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 flate2 = "1"
