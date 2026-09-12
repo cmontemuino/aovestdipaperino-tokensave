@@ -28,6 +28,25 @@ pub(crate) struct Spinner {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Keeps the tail of a spinner message short enough not to wrap a typical
+/// 80-column terminal.
+///
+/// The cut is by bytes, so it can land inside a multi-byte character: a
+/// Hangul or CJK path used to panic this inside the spinner thread, which
+/// froze the progress line for the rest of the run while indexing carried on
+/// and exited 0 — indistinguishable from a hang on a large project (#527).
+/// Walking forward to the next boundary trims at most two more bytes.
+fn spinner_tail(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= 50 {
+        return text.into();
+    }
+    let mut start = text.len() - 49;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &text[start..]).into()
+}
+
 impl Spinner {
     pub(crate) fn new() -> Self {
         let message = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -46,11 +65,7 @@ impl Spinner {
                     let frame = frames[idx % frames.len()];
                     idx += 1;
                     // Truncate to avoid line wrapping on typical terminals.
-                    let display: std::borrow::Cow<str> = if text.len() > 50 {
-                        format!("…{}", &text[text.len() - 49..]).into()
-                    } else {
-                        text.as_str().into()
-                    };
+                    let display = spinner_tail(&text);
                     let mut stderr = std::io::stderr();
                     let _ = write!(stderr, "\r\x1b[2K{} {}", frame, display);
                     let _ = stderr.flush();
@@ -827,7 +842,40 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
 
             // Best-effort during `install`: a hook that could not be written
             // must not fail the whole install. The reason was already printed.
-            let _ = tokensave::agents::offer_git_post_commit_hook(&tokensave_bin, git_hook);
+            //
+            // Since #506 the hooks go into the current repository rather than
+            // claiming a global `core.hooksPath` — a single machine-wide slot
+            // whose capture breaks every other tool's hook installer. `init`
+            // has always been per-repository for the same reason. `--git-hook
+            // global` still takes the slot for anyone who wants it.
+            match git_hook {
+                tokensave::agents::GitHookMode::Global => {
+                    let _ = tokensave::agents::offer_git_post_commit_hook(&tokensave_bin, git_hook);
+                }
+                tokensave::agents::GitHookMode::No => {}
+                mode => {
+                    if let Some(warning) = tokensave::agents::global_hookspath_conflict_warning() {
+                        eprintln!("{warning}");
+                    }
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                    let forced = matches!(mode, tokensave::agents::GitHookMode::Yes);
+                    if forced && tokensave::agents::repo_hooks_dir(&cwd).is_none() {
+                        // `install` is machine-wide and is often run outside a
+                        // repository, so the default path stays quiet. Asking
+                        // for the hooks explicitly and getting nothing is worth
+                        // a word, since the request could not be honored.
+                        eprintln!(
+                            "  \x1b[33m⚠\x1b[0m --git-hook yes installs this repository's hooks, \
+                             but {} is not a git repository.\n     Run it inside one, or use \
+                             `tokensave init` / `tokensave githooks on --local --path <repo>`.\n     \
+                             For one hook directory shared by every repo: `--git-hook global`.",
+                            cwd.display()
+                        );
+                    } else {
+                        offer_local_git_hooks(&cwd, forced, false);
+                    }
+                }
+            }
         }
         Commands::Reinstall {
             wildcard_permissions,
@@ -1226,9 +1274,12 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                 (Some("on"), false) => {
                     // The specific reason was already printed; this only stops
                     // `githooks on` from reporting a failed install as success.
+                    // `githooks on` without `--local` is the explicit request
+                    // for the machine-wide hooks; `--local` above is how the
+                    // caller asks for this repository's own.
                     if let Err(message) = tokensave::agents::offer_git_post_commit_hook(
                         &current_bin_path(),
-                        tokensave::agents::GitHookMode::Yes,
+                        tokensave::agents::GitHookMode::Global,
                     ) {
                         return Err(tokensave::errors::TokenSaveError::Config { message });
                     }
@@ -2058,3 +2109,62 @@ fn watch_for_orphaning() {
 /// No reparenting signal to watch for off Unix.
 #[cfg(not(unix))]
 fn watch_for_orphaning() {}
+
+#[cfg(test)]
+mod tests {
+    use super::spinner_tail;
+
+    /// A short message is passed through untouched, with no ellipsis.
+    #[test]
+    fn a_short_message_is_not_truncated() {
+        assert_eq!(
+            spinner_tail("[1/10] syncing src/lib.rs"),
+            "[1/10] syncing src/lib.rs"
+        );
+    }
+
+    /// The tail of a long ASCII message is kept, prefixed with an ellipsis.
+    #[test]
+    fn a_long_ascii_message_keeps_its_tail() {
+        let text = format!(
+            "[8/3000] syncing {}/deep/nested/file.rs (ETA: 184s)",
+            "a".repeat(80)
+        );
+        let out = spinner_tail(&text);
+        assert!(out.starts_with('…'), "expected an ellipsis prefix: {out}");
+        assert!(
+            out.ends_with("(ETA: 184s)"),
+            "expected the tail to survive: {out}"
+        );
+    }
+
+    /// The regression: a byte cut landing inside a Hangul character must not
+    /// panic. The `.md`/`a.md`/`ab.md` suffixes walk the cut through every
+    /// offset inside a 3-byte character, so one of them lands mid-character
+    /// whatever the exact message length.
+    #[test]
+    fn a_cut_inside_a_multibyte_character_does_not_panic() {
+        for suffix in ["", "a", "ab"] {
+            let text = format!(
+                "[8/3000] syncing 문서/1310_플랫폼아키텍처개요문서설치안내가이드입니다{suffix}.md (ETA: 184s)"
+            );
+            let out = spinner_tail(&text);
+            assert!(out.starts_with('…'), "expected an ellipsis prefix: {out}");
+            assert!(
+                out.ends_with(".md (ETA: 184s)"),
+                "expected the tail to survive: {out}"
+            );
+        }
+    }
+
+    /// The same cut over 4-byte characters, where a naive `+1` fixup would
+    /// still land inside the character.
+    #[test]
+    fn a_cut_inside_a_four_byte_character_does_not_panic() {
+        for pad in 0..4 {
+            let text = format!("{}{} done", "🚀".repeat(20), "x".repeat(pad));
+            let out = spinner_tail(&text);
+            assert!(out.ends_with("done"), "expected the tail to survive: {out}");
+        }
+    }
+}
