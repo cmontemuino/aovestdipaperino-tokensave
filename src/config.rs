@@ -157,17 +157,17 @@ pub struct TokenSaveConfig {
 /// every text extension would turn `tokensave_files` into a directory listing.
 fn default_artifact_extensions() -> Vec<String> {
     [
-        "feature", "json", "yaml", "yml", "sql", "toml", "proto", "graphql", "md",
+        "feature", "json", "yaml", "yml", "sql", "toml", "proto", "graphql", "md", "bnd", "bndrun",
     ]
     .iter()
     .map(|ext| (*ext).to_string())
     .collect()
 }
 
-/// Serde default for [`TokenSaveConfig::report_savings`], so configs written
-/// before #356 keep reporting savings rather than silently going quiet.
+/// Serde default for [`TokenSaveConfig::report_savings`]. Off by default so
+/// MCP results stay compact; accounting to the global DB still happens.
 fn default_report_savings() -> bool {
-    true
+    false
 }
 
 /// Serde default for [`TokenSaveConfig::max_auto_sync_files`], so configs
@@ -298,7 +298,19 @@ pub fn save_config(project_root: &Path, config: &TokenSaveConfig) -> Result<()> 
     let config_path = get_config_path(project_root);
     let tmp_path = config_path.with_extension("tmp");
 
-    let json = serde_json::to_string_pretty(config).map_err(|e| TokenSaveError::Config {
+    let mut value = serde_json::to_value(config).map_err(|e| TokenSaveError::Config {
+        message: format!("failed to serialize config: {e}"),
+    })?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "_comment".to_string(),
+            serde_json::Value::String(
+                "TOKENSAVE_* environment variables override matching config values when set."
+                    .to_string(),
+            ),
+        );
+    }
+    let json = serde_json::to_string_pretty(&value).map_err(|e| TokenSaveError::Config {
         message: format!("failed to serialize config: {e}"),
     })?;
 
@@ -972,19 +984,19 @@ mod tests {
     }
 
     #[test]
-    fn report_savings_defaults_to_on() {
-        // #356 asked for an opt-out, not a change of default.
-        assert!(TokenSaveConfig::default().report_savings);
+    fn report_savings_defaults_to_off() {
+        // #561: metrics are off by default in MCP results.
+        assert!(!TokenSaveConfig::default().report_savings);
     }
 
     #[test]
-    fn configs_written_before_the_field_existed_keep_reporting() {
-        // Serde must not read a missing field as `false` and silently go quiet
-        // on every project initialized before #356.
+    fn configs_written_before_the_field_existed_default_to_off() {
+        // #561: metrics are off by default, so a config written before the
+        // field existed now defaults to off rather than silently reporting.
         let json = r#"{"version":1,"root_dir":"/x","exclude":[],"max_file_size":1000,
                        "extract_docstrings":true,"track_call_sites":true}"#;
         let config: TokenSaveConfig = serde_json::from_str(json).unwrap();
-        assert!(config.report_savings);
+        assert!(!config.report_savings);
     }
 
     #[test]

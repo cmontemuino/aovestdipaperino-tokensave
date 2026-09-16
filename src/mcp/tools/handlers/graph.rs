@@ -15,7 +15,7 @@ use crate::types::{BuildContextOptions, EdgeKind, Node, NodeKind, Visibility};
 use super::super::ToolResult;
 use super::{
     effective_path, filter_by_path_lists, filter_by_scope, parse_string_array, require_node_id,
-    truncate_response, truncate_response_keep_tail, unique_file_paths,
+    truncate_response, truncate_response_keep_tail, unique_file_paths, SessionState,
 };
 
 /// Rounds a derived health metric to two decimal places for compact JSON.
@@ -66,6 +66,7 @@ pub(super) async fn handle_search(
     cg: &TokenSave,
     args: Value,
     scope_prefix: Option<&str>,
+    session: Option<&SessionState>,
 ) -> Result<ToolResult> {
     let query =
         args.get("query")
@@ -84,12 +85,32 @@ pub(super) async fn handle_search(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    let format = args
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text");
+
+    let ids = args
+        .get("ids")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let path_include = parse_string_array(&args, "path_include");
     let path_exclude = parse_string_array(&args, "path_exclude");
 
     if literal {
-        return handle_literal_search(cg, query, limit, scope_prefix, &path_include, &path_exclude)
-            .await;
+        return handle_literal_search(
+            cg,
+            query,
+            limit,
+            scope_prefix,
+            &path_include,
+            &path_exclude,
+            format,
+            ids,
+            session,
+        )
+        .await;
     }
 
     let mut results = if path_include.is_empty() && path_exclude.is_empty() {
@@ -118,25 +139,62 @@ pub(super) async fn handle_search(
     let items: Vec<Value> = results
         .iter()
         .map(|r| {
-            json!({
-                "id": r.node.id,
+            let mut item = json!({
                 "name": r.node.name,
                 "kind": r.node.kind.as_str(),
                 "file": r.node.file_path,
                 "line": super::display_line(r.node.start_line),
                 "signature": r.node.signature.as_deref().map(crate::context::compact_signature),
                 "score": r.score,
-            })
+            });
+            if ids {
+                item["id"] = json!(r.node.id);
+            }
+            item
         })
         .collect();
 
     // An empty array is where a cross-repo session gives up and concludes the
     // symbol does not exist, so this is the one place the sibling graphs are
     // worth naming (#375). Shape only changes when there is nothing to return.
+    let item_count = items.len();
+    let text_output = if format == "text" {
+        let mut text = format!("count: {item_count}\n\n");
+        for item in &items {
+            let file = item["file"].as_str().unwrap_or_default();
+            let line = item["line"].as_u64().unwrap_or(0);
+            let name = item["name"].as_str().unwrap_or_default();
+            let kind = item["kind"].as_str().unwrap_or_default();
+            let signature = item["signature"].as_str();
+            match signature {
+                Some(sig) => {
+                    let _ = writeln!(text, "{file}:{line}: {name} ({kind}) — {sig}");
+                }
+                None => {
+                    let _ = writeln!(text, "{file}:{line}: {name} ({kind})");
+                }
+            }
+        }
+        Some(text)
+    } else {
+        None
+    };
+
     let payload = match super::sibling_note(items.is_empty(), cg.project_root()).await {
         Some(note) => note,
         None => Value::Array(items),
     };
+
+    if let Some(mut text) = text_output {
+        if let Some(note) = payload.as_str() {
+            text.push_str(note);
+            text.push('\n');
+        }
+        return Ok(ToolResult {
+            value: json!({ "content": [{ "type": "text", "text": truncate_response(&text) }] }),
+            touched_files,
+        });
+    }
 
     let output = serde_json::to_string_pretty(&payload).unwrap_or_default();
     Ok(ToolResult {
@@ -243,6 +301,7 @@ const LITERAL_SCAN_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// `{ file, line, text, enclosing, enclosing_id }` location. Scanning is
 /// deterministic (files sorted by path) and stops as soon as `limit` matches
 /// are collected.
+#[allow(clippy::too_many_arguments)]
 async fn handle_literal_search(
     cg: &TokenSave,
     query: &str,
@@ -250,6 +309,9 @@ async fn handle_literal_search(
     scope_prefix: Option<&str>,
     path_include: &[String],
     path_exclude: &[String],
+    format: &str,
+    ids: bool,
+    session: Option<&SessionState>,
 ) -> Result<ToolResult> {
     if query.is_empty() {
         return Err(TokenSaveError::Config {
@@ -314,13 +376,18 @@ async fn handle_literal_search(
                 .filter(|n| n.start_line <= line0 && line0 <= n.end_line)
                 .min_by_key(|n| n.end_line.saturating_sub(n.start_line));
 
-            matches.push(json!({
+            let enclosing_name = enclosing.as_ref().map(|n| n.name.clone());
+            let enclosing_id = enclosing.as_ref().map(|n| n.id.clone());
+            let mut match_value = json!({
                 "file": file.path,
                 "line": line_no,
                 "text": line.trim(),
-                "enclosing": enclosing.map(|n| n.name.clone()),
-                "enclosing_id": enclosing.map(|n| n.id.clone()),
-            }));
+                "enclosing": enclosing_name,
+            });
+            if ids {
+                match_value["enclosing_id"] = json!(enclosing_id);
+            }
+            matches.push(match_value);
             if !touched.contains(&file.path) {
                 touched.push(file.path.clone());
             }
@@ -342,9 +409,55 @@ async fn handle_literal_search(
     if let Some(unscanned) =
         unscanned_report(cg, &indexed_paths, scope_prefix, path_include, path_exclude)
     {
+        let files = unscanned["files"].as_u64().unwrap_or(0);
+        let compact = json!({ "files": files, "hint": "tokensave_files --unscanned" });
+        let should_compact = session.is_some_and(|session| {
+            let root = cg.project_root().to_string_lossy().to_string();
+            let mut shown = session
+                .unscanned_shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !shown.insert(root)
+        });
+        let value = if should_compact { compact } else { unscanned };
         if let Some(object) = payload.as_object_mut() {
-            object.insert("unscanned".to_string(), unscanned);
+            object.insert("unscanned".to_string(), value);
         }
+    }
+    if format == "text" {
+        let mut text = format!("count: {}\n\n", matches.len());
+        for m in &matches {
+            let file = m["file"].as_str().unwrap_or_default();
+            let line = m["line"].as_u64().unwrap_or(0);
+            let line_text = m["text"].as_str().unwrap_or_default();
+            let _ = writeln!(text, "{file}:{line}: {line_text}");
+        }
+        if let Some(unscanned) = payload.get("unscanned") {
+            let files = unscanned["files"].as_u64().unwrap_or(0);
+            if let Some(extensions) = unscanned.get("extensions").and_then(Value::as_array) {
+                let _ = writeln!(text, "unscanned: {files} files");
+                for entry in extensions {
+                    let ext = entry["extension"].as_str().unwrap_or_default();
+                    let count = entry["files"].as_u64().unwrap_or(0);
+                    let _ = writeln!(text, "  - {ext}: {count}");
+                }
+                if let Some(reason) = unscanned.get("reason").and_then(Value::as_str) {
+                    let _ = writeln!(text, "reason: {reason}");
+                }
+                if let Some(remedy) = unscanned.get("remedy").and_then(Value::as_str) {
+                    let _ = writeln!(text, "remedy: {remedy}");
+                }
+            } else {
+                let _ = writeln!(
+                    text,
+                    "unscanned: {files} files (tokensave_files --unscanned)"
+                );
+            }
+        }
+        return Ok(ToolResult {
+            value: json!({ "content": [{ "type": "text", "text": truncate_response(&text) }] }),
+            touched_files,
+        });
     }
     let output = serde_json::to_string_pretty(&payload).unwrap_or_default();
     Ok(ToolResult {

@@ -487,9 +487,9 @@ ignoring it.
 
 `tokensave_files` covers more than source. Files whose extension is listed in
 `artifact_extensions` (`.feature`, `.json`, `.yaml`, `.yml`, `.sql`, `.toml`,
-`.proto`, `.graphql`, `.md` by default) are tracked by path so questions like
-"where are the `.feature` files for the login flow?" have a graph answer rather
-than a blocked `find` (#323). They are never parsed and contribute no symbols;
+`.proto`, `.graphql`, `.md`, `.bnd`, `.bndrun` by default) are tracked by path
+so questions like "where are the `.feature` files for the login flow?" have a
+graph answer rather than a blocked `find` (#323). They are never parsed and contribute no symbols;
 `kind: "artifact"` and `kind: "code"` filter between the two, and analyses that
 mean "code" exclude them. An extension already handled by a language extractor
 is ignored in this list, so it cannot be used to stop a language being parsed.
@@ -1078,14 +1078,17 @@ This project is a Rust port of the original [CodeGraph](https://github.com/colby
 ## Building
 
 ```bash
-cargo build --release                          # full (50+ languages, default)
-cargo build --release --features medium        # medium tier
-cargo build --release --no-default-features    # lite (smallest binary)
+cargo build --locked --release                          # full (50+ languages, default)
+cargo build --locked --release --features medium        # medium tier
+cargo build --locked --release --no-default-features    # lite (smallest binary)
 
-cargo test                                     # run all tests (requires full)
-cargo check --no-default-features              # verify lite compiles
-cargo clippy --all
+cargo test --workspace --locked                         # run all tests (requires full)
+cargo check --locked --no-default-features              # verify lite compiles
+cargo clippy --workspace --all-targets --locked
 ```
+
+Development commands use debug builds; installation uses optimized release output
+only (`cargo install --path . --locked`). `target/debug` is never an installation input.
 
 ## Star History
 

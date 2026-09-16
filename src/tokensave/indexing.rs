@@ -530,6 +530,9 @@ impl TokenSave {
         let now_str = current_timestamp().to_string();
         self.db.set_metadata("last_full_sync_at", &now_str).await?;
         self.db.set_metadata("last_sync_at", &now_str).await?;
+        self.db
+            .set_metadata("last_full_index_version", env!("CARGO_PKG_VERSION"))
+            .await?;
         self.touch_branch_synced();
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
@@ -2147,6 +2150,16 @@ impl TokenSave {
         Ok(())
     }
 
+    /// 1-based inclusive line range covered by a byte span in `source`.
+    fn byte_span_lines(source: &str, start: usize, end: usize) -> (u32, u32) {
+        let start_line = source[..start].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        let mut end_line = source[..end].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        if end > start && source.as_bytes()[end - 1] == b'\n' {
+            end_line = end_line.saturating_sub(1);
+        }
+        (start_line, end_line.max(start_line))
+    }
+
     /// Performs a single string replacement.
     /// Fails if `old_str` is not found or matches more than once.
     ///
@@ -2172,6 +2185,11 @@ impl TokenSave {
         let matches: Vec<_> = source.match_indices(old_str).collect();
         match matches.len() {
             0 => {
+                let needle = crate::text::utf8_prefix_at_or_before(old_str, 20);
+                let nearest = source
+                    .lines()
+                    .find(|line| line.contains(needle))
+                    .map(str::to_string);
                 return Ok(EditResult {
                     success: false,
                     file_path: display_path,
@@ -2179,7 +2197,10 @@ impl TokenSave {
                     matched_str: old_str.to_string(),
                     new_str: new_str.to_string(),
                     message: format!("old_str not found in {path}"),
-                })
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest,
+                });
             }
             1 => {}
             n => {
@@ -2190,10 +2211,14 @@ impl TokenSave {
                     matched_str: old_str.to_string(),
                     new_str: new_str.to_string(),
                     message: format!("old_str matches {n} times, must match exactly once"),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest: None,
                 })
             }
         }
 
+        let match_start = matches[0].0;
         let modified = source.replacen(old_str, new_str, 1);
 
         tokio::fs::write(&abs_path, &modified)
@@ -2206,6 +2231,9 @@ impl TokenSave {
             self.reindex_file(rel).await?;
         }
 
+        let changed_lines =
+            Self::byte_span_lines(&source, match_start, match_start + old_str.len());
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(EditResult {
             success: true,
             file_path: display_path,
@@ -2213,6 +2241,9 @@ impl TokenSave {
             matched_str: old_str.to_string(),
             new_str: new_str.to_string(),
             message: "replacement successful".to_string(),
+            changed_lines,
+            digest,
+            nearest: None,
         })
     }
 
@@ -2319,6 +2350,9 @@ impl TokenSave {
                         "line number {line_num} out of range (file has {} lines)",
                         lines.len()
                     ),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest: None,
                 });
             }
             line_num - 1
@@ -2332,6 +2366,10 @@ impl TokenSave {
                 .collect();
 
             if matching_lines.is_empty() {
+                let nearest = lines
+                    .iter()
+                    .find(|line| line.contains(anchor_prefix))
+                    .map(|line| (*line).to_string());
                 return Ok(InsertResult {
                     success: false,
                     file_path: display_path,
@@ -2340,6 +2378,9 @@ impl TokenSave {
                     content: content.to_string(),
                     before,
                     message: format!("anchor '{anchor}' not found"),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest,
                 });
             }
             if matching_lines.len() > 1 {
@@ -2354,6 +2395,9 @@ impl TokenSave {
                         "anchor '{anchor}' matches {} lines, must match exactly one",
                         matching_lines.len()
                     ),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest: None,
                 });
             }
             matching_lines[0]
@@ -2378,6 +2422,14 @@ impl TokenSave {
             self.reindex_file(rel).await?;
         }
 
+        let start_line = if before {
+            (anchor_line + 1) as u32
+        } else {
+            (anchor_line + 2) as u32
+        };
+        let end_line = start_line + content.matches('\n').count() as u32;
+        let changed_lines = (start_line, end_line);
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(InsertResult {
             success: true,
             file_path: display_path,
@@ -2386,6 +2438,9 @@ impl TokenSave {
             content: content.to_string(),
             before,
             message: format!("inserted at line {}", anchor_line + 1),
+            changed_lines,
+            digest,
+            nearest: None,
         })
     }
 
@@ -2428,6 +2483,9 @@ impl TokenSave {
                     target.end_line,
                     lines.len()
                 ),
+                changed_lines: (0, 0),
+                digest: String::new(),
+                nearest: None,
             });
         }
         let trailing_newline = source.ends_with('\n');
@@ -2447,6 +2505,8 @@ impl TokenSave {
         if let Some(rel) = &rel_path {
             self.reindex_file(rel).await?;
         }
+        let changed_lines = (target.start_line + 1, target.end_line + 1);
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(EditResult {
             success: true,
             file_path: display_path,
@@ -2459,6 +2519,205 @@ impl TokenSave {
                 target.start_line + 1,
                 target.end_line + 1
             ),
+            changed_lines,
+            digest,
+            nearest: None,
+        })
+    }
+
+    /// Deletes a named symbol, including its leading doc comment/attribute
+    /// block and one adjacent blank line. Resolves the symbol via exact
+    /// qualified-name match — if the name is ambiguous, callable definitions
+    /// win; if still ambiguous after that filter, the edit is refused so we
+    /// don't clobber the wrong site.
+    ///
+    /// `root_override` retargets where the symbol's (index-relative) file
+    /// path is written to — e.g. a git worktree that shares the same
+    /// relative layout as the indexed project root but lives at a different
+    /// absolute location. See [`Self::resolve_edit_target`] for semantics.
+    pub async fn delete_symbol(
+        &self,
+        symbol: &str,
+        include_doc_comment: bool,
+        root_override: Option<&str>,
+    ) -> Result<EditResult> {
+        let target = resolve_symbol_for_edit(self, symbol).await?;
+        let (abs_path, rel_path) = self.resolve_edit_target(&target.file_path, root_override);
+        let resolved_path = abs_path.to_string_lossy().to_string();
+        let display_path = rel_path.clone().unwrap_or_else(|| resolved_path.clone());
+        let source = std::fs::read_to_string(&abs_path).map_err(|e| TokenSaveError::Config {
+            message: format!("failed to read {resolved_path}: {e}"),
+        })?;
+        let lines: Vec<&str> = source.lines().collect();
+        let mut start = if include_doc_comment {
+            target.attrs_start_line as usize
+        } else {
+            target.start_line as usize
+        };
+        if include_doc_comment {
+            // `attrs_start_line` covers attributes but not every language's
+            // doc-comment marker, so scan upward for a contiguous doc-comment
+            // block directly above the symbol and include it when present.
+            let mut doc_start = target.start_line as usize;
+            while doc_start > 0 {
+                let line = lines[doc_start - 1].trim();
+                if line.starts_with("///")
+                    || line.starts_with("/**")
+                    || line.starts_with("/*")
+                    || line.starts_with('#')
+                    || line.starts_with("--")
+                    || line.starts_with(';')
+                    || line.starts_with('\'')
+                    || line.starts_with('"')
+                {
+                    doc_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            start = start.min(doc_start);
+        }
+        let end_inclusive = (target.end_line as usize).min(lines.len().saturating_sub(1));
+        if start >= lines.len() || start > end_inclusive {
+            return Ok(EditResult {
+                success: false,
+                file_path: display_path,
+                resolved_path,
+                matched_str: symbol.to_string(),
+                new_str: String::new(),
+                message: format!(
+                    "symbol range [{}..={}] out of bounds for {}-line file",
+                    target.start_line,
+                    target.end_line,
+                    lines.len()
+                ),
+                changed_lines: (0, 0),
+                digest: String::new(),
+                nearest: None,
+            });
+        }
+        let mut remove_start = start;
+        let mut remove_end = end_inclusive;
+        if remove_end + 1 < lines.len() && lines[remove_end + 1].trim().is_empty() {
+            remove_end += 1;
+        } else if remove_start > 0 && lines[remove_start - 1].trim().is_empty() {
+            remove_start -= 1;
+        }
+        let mut rebuilt: Vec<String> = Vec::with_capacity(lines.len());
+        rebuilt.extend(lines[..remove_start].iter().map(|s| (*s).to_string()));
+        rebuilt.extend(lines[remove_end + 1..].iter().map(|s| (*s).to_string()));
+        let mut modified = rebuilt.join("\n");
+        if source.ends_with('\n') && !rebuilt.is_empty() {
+            modified.push('\n');
+        }
+        tokio::fs::write(&abs_path, &modified)
+            .await
+            .map_err(|e| TokenSaveError::Config {
+                message: format!("failed to write {resolved_path}: {e}"),
+            })?;
+        if let Some(rel) = &rel_path {
+            self.reindex_file(rel).await?;
+        }
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
+        Ok(EditResult {
+            success: true,
+            file_path: display_path,
+            resolved_path,
+            matched_str: symbol.to_string(),
+            new_str: String::new(),
+            message: format!(
+                "deleted {}:{}-{}",
+                target.file_path,
+                remove_start + 1,
+                remove_end + 1
+            ),
+            changed_lines: ((remove_start + 1) as u32, (remove_end + 1) as u32),
+            digest,
+            nearest: None,
+        })
+    }
+
+    /// Replaces a contiguous 1-based inclusive line range in a file with
+    /// `new_content`. `expected_digest` (from `tokensave_read`) makes a stale
+    /// range fail instead of corrupting the file; `new_content: ""` deletes
+    /// the block.
+    ///
+    /// `root_override` retargets resolution of a *relative* `path` to a
+    /// directory other than the indexed project root (e.g. a git worktree).
+    /// An absolute `path` is always honored verbatim regardless of this
+    /// parameter. See [`Self::resolve_edit_target`] for full semantics.
+    pub async fn replace_lines(
+        &self,
+        path: &str,
+        start: u32,
+        end: u32,
+        new_content: &str,
+        expected_digest: Option<&str>,
+        root_override: Option<&str>,
+    ) -> Result<LineReplaceResult> {
+        let (abs_path, rel_path) = self.resolve_edit_target(path, root_override);
+        let resolved_path = abs_path.to_string_lossy().to_string();
+        let display_path = rel_path.clone().unwrap_or_else(|| resolved_path.clone());
+        let source = std::fs::read_to_string(&abs_path).map_err(|e| TokenSaveError::Config {
+            message: format!("failed to read {resolved_path}: {e}"),
+        })?;
+        let before_digest = crate::context::read_cache::digest_bytes(source.as_bytes());
+        if let Some(expected) = expected_digest {
+            if before_digest != expected {
+                return Ok(LineReplaceResult {
+                    success: false,
+                    file_path: display_path,
+                    resolved_path,
+                    changed_lines: (0, 0),
+                    digest: before_digest.clone(),
+                    message: format!("digest mismatch: expected {expected}, got {before_digest}"),
+                });
+            }
+        }
+        let lines: Vec<&str> = source.lines().collect();
+        let start_idx = start.saturating_sub(1) as usize;
+        let end_idx = (end as usize).min(lines.len());
+        if start == 0 || start_idx >= lines.len() || start_idx >= end_idx {
+            return Ok(LineReplaceResult {
+                success: false,
+                file_path: display_path,
+                resolved_path,
+                changed_lines: (0, 0),
+                digest: before_digest,
+                message: format!(
+                    "line range {start}-{end} out of bounds (file has {} lines)",
+                    lines.len()
+                ),
+            });
+        }
+        let trailing_newline = source.ends_with('\n');
+        let mut rebuilt: Vec<String> = Vec::with_capacity(lines.len());
+        rebuilt.extend(lines[..start_idx].iter().map(|s| (*s).to_string()));
+        let replacement = new_content.trim_end_matches('\n');
+        if !replacement.is_empty() {
+            rebuilt.push(replacement.to_string());
+        }
+        rebuilt.extend(lines[end_idx..].iter().map(|s| (*s).to_string()));
+        let mut modified = rebuilt.join("\n");
+        if trailing_newline {
+            modified.push('\n');
+        }
+        tokio::fs::write(&abs_path, &modified)
+            .await
+            .map_err(|e| TokenSaveError::Config {
+                message: format!("failed to write {resolved_path}: {e}"),
+            })?;
+        if let Some(rel) = &rel_path {
+            self.reindex_file(rel).await?;
+        }
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
+        Ok(LineReplaceResult {
+            success: true,
+            file_path: display_path,
+            resolved_path,
+            changed_lines: (start, end),
+            digest,
+            message: format!("replaced lines {start}-{end}"),
         })
     }
 
@@ -2506,6 +2765,9 @@ impl TokenSave {
                 content: content.to_string(),
                 before,
                 message: format!("anchor line {anchor_line} past EOF ({})", lines.len()),
+                changed_lines: (0, 0),
+                digest: String::new(),
+                nearest: None,
             });
         }
         let trailing_newline = source.ends_with('\n');
@@ -2525,6 +2787,10 @@ impl TokenSave {
         if let Some(rel) = &rel_path {
             self.reindex_file(rel).await?;
         }
+        let start_line = (anchor_line + 1) as u32;
+        let end_line = start_line + content.matches('\n').count() as u32;
+        let changed_lines = (start_line, end_line);
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(InsertResult {
             success: true,
             file_path: display_path,
@@ -2539,6 +2805,9 @@ impl TokenSave {
                 target.kind.as_str(),
                 anchor_line + 1
             ),
+            changed_lines,
+            digest,
+            nearest: None,
         })
     }
 

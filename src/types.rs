@@ -589,6 +589,11 @@ pub struct GraphStats {
     pub last_sync_at: u64,
     /// Timestamp of the most recent full (re)index (0 if never indexed).
     pub last_full_sync_at: u64,
+    /// tokensave version that performed the most recent full (re)index.
+    /// Empty when the project has never been fully indexed by a recorded
+    /// version, so consumers can tell "graph built by X" as a fact rather
+    /// than inferring it from `last_indexed_version` (#554).
+    pub last_full_index_version: String,
     /// Duration in milliseconds of the most recent sync (0 if unknown).
     pub last_sync_duration_ms: u64,
 }
@@ -802,6 +807,12 @@ pub struct EditResult {
     pub matched_str: String,
     pub new_str: String,
     pub message: String,
+    /// 1-based inclusive line range changed by the edit.
+    pub changed_lines: (u32, u32),
+    /// SHA-256 hex digest of the file after the edit.
+    pub digest: String,
+    /// Nearest candidate line when the edit failed to find its target.
+    pub nearest: Option<String>,
 }
 
 /// Result of a multi-string replacement edit.
@@ -825,6 +836,26 @@ pub struct InsertResult {
     pub anchor_line: u32,
     pub content: String,
     pub before: bool,
+    pub message: String,
+    /// 1-based inclusive line range changed by the edit.
+    pub changed_lines: (u32, u32),
+    /// SHA-256 hex digest of the file after the edit.
+    pub digest: String,
+    /// Nearest candidate line when the edit failed to find its anchor.
+    pub nearest: Option<String>,
+}
+
+/// Result of a line-range replacement edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineReplaceResult {
+    pub success: bool,
+    pub file_path: String,
+    /// Fully-resolved absolute filesystem path that was actually read/written.
+    pub resolved_path: String,
+    /// 1-based inclusive line range replaced.
+    pub changed_lines: (u32, u32),
+    /// SHA-256 hex digest of the file after the edit.
+    pub digest: String,
     pub message: String,
 }
 

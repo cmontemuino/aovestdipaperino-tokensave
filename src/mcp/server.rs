@@ -25,20 +25,17 @@ use super::graph_scope::{
 };
 use super::tools::{
     baseline_policy, cap_baseline, get_always_load_tool_definitions, get_tool_definitions,
-    handle_tool_call, is_graph_scoped_tool, request_overhead_tokens, schema_overhead_tokens,
-    settle_session_debt,
+    handle_tool_call_with_session, is_graph_scoped_tool, is_selectorless_local_graph_tool,
+    request_overhead_tokens, schema_overhead_tokens, settle_session_debt, SessionState,
 };
 use super::transport::{ErrorCode, JsonRpcRequest, JsonRpcResponse};
 
-/// Selector-less local graph tools refused after tracked-branch drift.
-pub(crate) const LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS: &[&str] = &[
-    "tokensave_affected",
-    "tokensave_diff_context",
-    "tokensave_simplify_scan",
-    "tokensave_redundancy",
-    "tokensave_diagnostics",
-    "tokensave_diagnose",
-];
+// Selector-less local graph tools are refused after tracked-branch drift.
+// The refused set is derived at server construction from the tool registry
+// (the `tokensave/localGraphNoSelectors` marker set by
+// `super::tools::is_selectorless_local_graph_tool`) instead of a
+// hard-coded name list, so a future selector-less local graph tool cannot
+// silently fall outside the gate.
 
 /// Runtime statistics for the MCP server.
 pub struct ServerStats {
@@ -336,6 +333,8 @@ impl Drop for AccountingTaskGuard {
 pub struct McpServer {
     cg: TokenSave,
     graph_scoped_tools: HashSet<String>,
+    /// Selector-less local graph tools refused after tracked-branch drift.
+    selectorless_local_graph_tools: HashSet<String>,
     stats: ServerStats,
     tool_call_counts: std::sync::Mutex<HashMap<String, u64>>,
     /// Approximate token count per indexed file (`file_path` -> tokens).
@@ -379,6 +378,9 @@ pub struct McpServer {
     /// at startup and named in the `initialize` instructions so a session knows
     /// which other graphs `graph_root` can reach (#375).
     sibling_projects: Vec<String>,
+    /// Session-scoped state shared across tool calls (e.g. which roots already
+    /// showed the full `unscanned` detail block from a literal search).
+    session_state: SessionState,
     /// Cached latest-version check result.
     version_cache: std::sync::Mutex<VersionCheckState>,
     /// Pending JSON-RPC notifications to send before the next response.
@@ -405,6 +407,13 @@ pub struct McpServer {
     /// [`maybe_sync_if_stale`](Self::maybe_sync_if_stale) so concurrent
     /// tool calls don't pile on the same walk.
     last_staleness_check_at: AtomicI64,
+    /// True while a lazy resync task spawned by
+    /// [`maybe_sync_if_stale`](Self::maybe_sync_if_stale) is still running.
+    /// The 30 s cooldown alone does not prevent overlap: once a resync
+    /// outlives its own cooldown window, the next call's `compare_exchange`
+    /// succeeds and would start a second walk over the same tree. Cleared by
+    /// the task itself on every exit path.
+    lazy_sync_in_flight: Arc<AtomicBool>,
     /// Cached worktree-vs-index mismatch detection for this session. `None`
     /// when no mismatch exists (the common case) or detection was skipped
     /// (not a git repo / git missing). Computed once at startup so we
@@ -443,6 +452,67 @@ pub struct McpServer {
 /// say what was skipped and how to do it deliberately — silently serving a
 /// stale (or empty) index is the failure mode that made #396 and #393 hard to
 /// diagnose from the outside.
+/// MCP revisions this server can serve, newest first.
+///
+/// The later revisions are additive over `2024-11-05` for the surface we
+/// actually implement — `tools/list`, `tools/call`, `resources/*` — so serving
+/// a client that pins one of them is a matter of agreeing on the stamp. What
+/// we do *not* yet emit (structured output, progress, resource links) is
+/// optional in every one of them. Advertising our own newest by default is a
+/// separate decision (#535 plan, phase 2) and deliberately not taken here.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] =
+    ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The revision assumed when a client sends no `protocolVersion`, or sends one
+/// that is not a string. Staying on the oldest keeps today's lenient clients
+/// byte-identical to pre-negotiation behaviour.
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Picks the `protocolVersion` to answer `initialize` with.
+///
+/// Previously this was hardcoded to `2024-11-05` and the client's request was
+/// never read — the dispatch site did not even pass `params` in. A host that
+/// pins a newer revision and validates the handshake strictly is entitled to
+/// treat that as a downgrade it did not agree to and drop the connection
+/// before `tools/list`, which surfaces to the user as a bare "MCP server failed
+/// to connect".
+///
+/// The rule is the spec's: echo the client's revision when we support it,
+/// otherwise answer with our newest and let the client decide whether it can
+/// proceed.
+fn negotiate_protocol_version(params: Option<&Value>) -> &'static str {
+    let requested = params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(|v| v.as_str());
+
+    match requested {
+        Some(version) => SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .find(|supported| **supported == version)
+            .copied()
+            .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]),
+        None => DEFAULT_PROTOCOL_VERSION,
+    }
+}
+
+/// How long a `tools/call` may block on the lazy resync before being answered
+/// from the graph as it stands (#535).
+///
+/// `TOKENSAVE_AUTOSYNC_BUDGET_MS` overrides the default; `0` restores the
+/// pre-#535 behaviour of waiting for the resync however long it takes. The
+/// default is deliberately well under the 30 s request deadline common in MCP
+/// clients, since the budget protects an *interactive* call: a resync that has
+/// not finished in a few seconds will not finish within a latency the caller
+/// would have tolerated either.
+fn auto_sync_budget() -> Option<std::time::Duration> {
+    const DEFAULT_BUDGET_MS: u64 = 5_000;
+    let ms = std::env::var("TOKENSAVE_AUTOSYNC_BUDGET_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUDGET_MS);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
 fn auto_sync_refusal(scope: &crate::tokensave::AutoSyncScope) -> String {
     match scope {
         crate::tokensave::AutoSyncScope::Uninitialized => {
@@ -559,6 +629,14 @@ impl McpServer {
             .filter(is_graph_scoped_tool)
             .map(|definition| definition.name)
             .collect();
+        // Derived from the same registry pass as `graph_scoped_tools`: any
+        // read-only local-graph tool without selectors is drift-refused, so a
+        // future selector-less tool cannot silently escape the gate.
+        let selectorless_local_graph_tools = get_tool_definitions()
+            .into_iter()
+            .filter(is_selectorless_local_graph_tool)
+            .map(|definition| definition.name)
+            .collect();
         // Approximates the schema payload the client actually loads into
         // context up front. Only the `anthropic/alwaysLoad` tools
         // (`tokensave_search`, `tokensave_context`, `tokensave_status`) are
@@ -599,6 +677,7 @@ impl McpServer {
         let server = Arc::new(Self {
             cg,
             graph_scoped_tools,
+            selectorless_local_graph_tools,
             stats: ServerStats::new(),
             tool_call_counts: std::sync::Mutex::new(HashMap::new()),
             file_token_map: std::sync::Mutex::new(file_token_map),
@@ -611,6 +690,7 @@ impl McpServer {
             last_flush_at: AtomicI64::new(0),
             global_db,
             sibling_projects,
+            session_state: SessionState::new(),
             version_cache: std::sync::Mutex::new(VersionCheckState {
                 latest: None,
                 checked_at: None,
@@ -621,6 +701,7 @@ impl McpServer {
             run_started: AtomicBool::new(false),
             timings_enabled: AtomicBool::new(false),
             last_staleness_check_at: AtomicI64::new(0),
+            lazy_sync_in_flight: Arc::new(AtomicBool::new(false)),
             worktree_mismatch,
             startup_catch_up_done: AtomicBool::new(false),
             version_reindex_started: AtomicBool::new(false),
@@ -740,7 +821,7 @@ impl McpServer {
     fn branch_drift_refusal(&self, tool_name: &str) -> Option<String> {
         if tool_name == "tokensave_status"
             || (!self.graph_scoped_tools.contains(tool_name)
-                && !LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS.contains(&tool_name))
+                && !self.selectorless_local_graph_tools.contains(tool_name))
         {
             return None;
         }
@@ -800,7 +881,15 @@ impl McpServer {
                 failures.push(format!("{}: {error}", root.display()));
                 continue;
             }
-            let outcome = handle_tool_call(&selected.cg, tool_name, root_args, None, None).await;
+            let outcome = handle_tool_call_with_session(
+                &selected.cg,
+                tool_name,
+                root_args,
+                None,
+                None,
+                Some(&self.session_state),
+            )
+            .await;
             let mut result = match outcome {
                 Ok(result) => result,
                 Err(error) => {
@@ -1007,6 +1096,35 @@ impl McpServer {
         true
     }
 
+    /// Test-only: clear the 30 s staleness cooldown so the next
+    /// [`Self::maybe_sync_if_stale`] actually runs. The startup catch-up sync
+    /// stamps this during `McpServer::new`, so without a reset an integration
+    /// test cannot reach the resync path at all inside its own lifetime.
+    #[doc(hidden)]
+    pub fn reset_staleness_cooldown(&self) {
+        self.last_staleness_check_at.store(0, Ordering::Release);
+    }
+
+    /// True while a lazy resync spawned by [`Self::maybe_sync_if_stale`] is
+    /// still running — i.e. the call that triggered it returned on its budget
+    /// rather than waiting the work out (#535).
+    pub fn lazy_sync_in_flight(&self) -> bool {
+        self.lazy_sync_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Blocks until no lazy resync is in flight, or `timeout` elapses.
+    /// Returns whether the resync finished in time.
+    pub async fn wait_for_lazy_sync(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.lazy_sync_in_flight() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        true
+    }
+
     /// Walk the project tree, sync any stale files, and refresh the
     /// file-to-token-count map — but only if at least 30 s have passed
     /// since the last successful sync. The cooldown is the gate: while
@@ -1019,7 +1137,7 @@ impl McpServer {
     /// same window see the stamp and bail. If the actual sync work
     /// fails, the stamp still advances — failure to walk the tree
     /// should not cause every subsequent tool call to retry.
-    pub async fn maybe_sync_if_stale(&self) {
+    pub async fn maybe_sync_if_stale(self: &Arc<Self>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1041,6 +1159,52 @@ impl McpServer {
             return;
         }
 
+        // Overlap guard (#535). The cooldown above is keyed on when a check
+        // *started*; a resync that runs longer than its own window would let
+        // the next call start a second walk over the same tree.
+        if self
+            .lazy_sync_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        // Bound the *wait*, not the work (#535). The walk and resync run in a
+        // detached task holding a strong reference, so an in-flight sync is
+        // never dropped part-way through its DB writes — the same reasoning as
+        // the startup catch-up sync. What is bounded is how long the calling
+        // tool blocks on it: past the budget we answer from the graph as it
+        // stands and let the resync land for a later call. Previously this
+        // work was unbounded and inline, so a large tree could stall an
+        // interactive call past the client's request deadline, and a client
+        // that disables a server on timeout lost tokensave for the session.
+        let server = Arc::clone(self);
+        let in_flight = Arc::clone(&self.lazy_sync_in_flight);
+        let task = tokio::spawn(async move {
+            server.run_lazy_resync().await;
+            in_flight.store(false, Ordering::Release);
+        });
+
+        let Some(budget) = auto_sync_budget() else {
+            // Opt-out: wait indefinitely, the pre-#535 behaviour.
+            let _ = task.await;
+            return;
+        };
+
+        if tokio::time::timeout(budget, task).await.is_err() {
+            eprintln!(
+                "[tokensave] lazy sync exceeded {}ms; answering from the current graph and \
+                 finishing the resync in the background",
+                budget.as_millis()
+            );
+        }
+    }
+
+    /// The body of the lazy resync: walk for stale files, sync them, refresh
+    /// the token map. Split out of [`Self::maybe_sync_if_stale`] so it can run
+    /// in a detached task that outlives the call that triggered it.
+    async fn run_lazy_resync(&self) {
         let stale = match self.cg.find_stale_files_bounded().await {
             crate::tokensave::AutoSyncScope::Sync(stale) => stale,
             scope => {
@@ -1616,6 +1780,7 @@ impl McpServer {
         let result = match request.method.as_str() {
             "initialize" => Some(Self::handle_initialize(
                 id,
+                request.params.as_ref(),
                 self.cg.report_savings(),
                 &self.sibling_projects,
             )),
@@ -1666,6 +1831,7 @@ impl McpServer {
     /// `tokensave_metrics:` line it refers to.
     fn handle_initialize(
         id: Value,
+        params: Option<&Value>,
         report_savings: bool,
         sibling_projects: &[String],
     ) -> JsonRpcResponse {
@@ -1700,7 +1866,7 @@ impl McpServer {
         JsonRpcResponse::success(
             id,
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiate_protocol_version(params),
                 "capabilities": {
                     "tools": {},
                     "resources": {},
@@ -2000,6 +2166,15 @@ impl McpServer {
             );
         };
 
+        // Logged before selector validation and before the pre-dispatch
+        // freshness/reindex gates (#535). Those gates can outlast a client's
+        // request deadline, and a call that hangs inside them used to print
+        // nothing at all, leaving the stderr tail naming the *previous* call
+        // and misdirecting the diagnosis. Entry and dispatch are separate
+        // lines so a tail ending in `tool call:` with no matching `dispatch:`
+        // localises the hang to the pre-dispatch work.
+        eprintln!("[tokensave] tool call: {tool_name}");
+
         let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         // Request-side cost of this call (tool name + arguments + JSON-RPC
@@ -2135,7 +2310,7 @@ impl McpServer {
             self.maybe_reindex_on_version_bump();
         }
 
-        eprintln!("[tokensave] tool call: {tool_name}");
+        eprintln!("[tokensave] dispatch: {tool_name}");
 
         let server_stats = if selected.is_none() && tool_name == "tokensave_status" {
             Some(self.server_stats_json().await)
@@ -2153,12 +2328,14 @@ impl McpServer {
             || (&self.cg, self.scope_prefix()),
             |selected| (&selected.cg, None),
         );
-        let dispatch_outcome = handle_tool_call(
+        let baseline = baseline_policy(tool_name, &arguments);
+        let dispatch_outcome = handle_tool_call_with_session(
             dispatch_graph,
             tool_name,
             arguments,
             server_stats,
             scope_prefix,
+            Some(&self.session_state),
         )
         .await;
         let handler_elapsed_us = handler_start.map(|t| t.elapsed().as_micros() as u64);
@@ -2515,11 +2692,7 @@ impl McpServer {
                 // is always at least as large as the source it wraps — see
                 // `accounting::baseline_policy`.
                 let full_file_tokens = self.touched_file_tokens(&result.touched_files);
-                let before_tokens = cap_baseline(
-                    baseline_policy(tool_name),
-                    full_file_tokens,
-                    tool_response_tokens,
-                );
+                let before_tokens = cap_baseline(baseline, full_file_tokens, tool_response_tokens);
 
                 // The metrics line itself is appended to `content` below, so
                 // it too costs the model tokens. Two-pass: render it once
@@ -2544,13 +2717,14 @@ impl McpServer {
                 // is deliberately left outside this gate, so `tokensave gain`
                 // still sees every call.
                 let emit_metrics_line = before_tokens > 0 && self.cg.report_savings();
-                let render_metrics = |before: u64, after: u64, saved: u64| -> String {
-                    format!("\ntokensave_metrics: before={before} after={after} saved={saved}")
+                let render_metrics = |before: u64, after: u64, result: u64, saved: u64| -> String {
+                    format!("\ntokensave_metrics: before={before} after={after} result={result} saved={saved}")
                 };
                 let metrics_line_tokens = if emit_metrics_line {
                     let provisional = render_metrics(
                         before_tokens,
                         after_pre_metrics,
+                        tool_response_tokens,
                         before_tokens.saturating_sub(after_pre_metrics),
                     );
                     (provisional.len() / 4) as u64
@@ -2598,7 +2772,7 @@ impl McpServer {
                     {
                         content.push(json!({
                             "type": "text",
-                            "text": render_metrics(before_tokens, after_tokens, net_saved)
+                            "text": render_metrics(before_tokens, after_tokens, tool_response_tokens, net_saved)
                         }));
                     }
                 }

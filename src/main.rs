@@ -268,6 +268,23 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     };
                     ag.install(&ctx).is_ok()
                 });
+            if outcome.changed {
+                // Refresh a tokensave-owned Claude rules file that exists on
+                // disk even when `claude` is not in `installed_agents` (#553).
+                // A user may register tokensave per project (`.mcp.json`) or
+                // remove the user-scope entry, so the agent is absent from the
+                // list while `~/.claude/rules/tokensave.md` is still
+                // tokensave's own file. Rewriting just that file is inside the
+                // contract; the full install would re-add an MCP entry the
+                // user deliberately removed. Idempotent: no-op when unchanged.
+                let claude_rules =
+                    tokensave::agents::integrations::claude::claude_managed_rules_path(&home);
+                if claude_rules.exists() {
+                    if let Ok(body) = tokensave::agents::rules_for_agent("claude") {
+                        let _ = tokensave::agents::write_managed_rules_file(&claude_rules, &body);
+                    }
+                }
+            }
             tokensave::agents::set_quiet_install(false);
             if outcome.ran {
                 // Say what this was and why (#419). The user did not ask for an
@@ -1030,6 +1047,15 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
         Commands::HookPromptSubmit => {
             tokensave::hooks::hook_prompt_submit().await;
         }
+        Commands::Hook { action } => match action {
+            cli::HookAction::PostCheckout {
+                prev_head,
+                new_head: _,
+                branch_flag,
+            } => {
+                commands::hook_post_checkout(prev_head.as_deref(), branch_flag.as_deref()).await;
+            }
+        },
         Commands::HookStop => {
             tokensave::hooks::hook_stop().await;
         }
@@ -1330,6 +1356,81 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     let status = if config.git_ignore { "on" } else { "off" };
                     eprintln!("gitignore: {status}");
                 }
+            }
+        }
+        Commands::AuditEdges { top, json } => {
+            let project_path = tokensave::config::resolve_path_with_discovery(None);
+            if !TokenSave::is_initialized(&project_path) {
+                return Err(tokensave::errors::TokenSaveError::Config {
+                    message: format!(
+                        "no TokenSave index at '{}' — run `tokensave init` first",
+                        project_path.display()
+                    ),
+                });
+            }
+            let cg = TokenSave::open(&project_path).await?;
+            let report = tokensave::edge_audit::audit(cg.db(), top).await?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "total_edges": report.total_edges,
+                        "gated_edges": report.gated_edges,
+                        "cross_file": report.cross_file,
+                        "sole_candidate_cross_file": report.sole_candidate_cross_file,
+                        "unreachable": report.unreachable,
+                        "hot_targets": report.hot_targets.iter().map(|t| serde_json::json!({
+                            "name": t.name,
+                            "file": t.file_path,
+                            "line": t.start_line,
+                            "kind": t.kind,
+                            "source_files": t.source_files,
+                            "edges": t.edges,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!("Edge audit — {}", project_path.display());
+                println!(
+                    "  total edges                       {:>8}",
+                    report.total_edges
+                );
+                println!(
+                    "  in gated languages (py/js/ts)     {:>8}",
+                    report.gated_edges
+                );
+                println!(
+                    "    cross-file                      {:>8}",
+                    report.cross_file
+                );
+                println!(
+                    "    sole-candidate                  {:>8}",
+                    report.sole_candidate_cross_file
+                );
+                println!(
+                    "      without reachability evidence {:>8}   <- diff this between commits",
+                    report.unreachable
+                );
+
+                if report.hot_targets.is_empty() {
+                    println!("\nNo unreachable sole-candidate cross-file targets.");
+                } else {
+                    println!("\nMost-collided targets:");
+                    for t in &report.hot_targets {
+                        println!(
+                            "  {:>6} edges from {:>4} files  {}:{}  {} ({})",
+                            t.edges, t.source_files, t.file_path, t.start_line, t.name, t.kind
+                        );
+                    }
+                }
+                println!(
+                    "\nAn edge counted here is one the index asserts but the source file \
+                     carries no\nevidence it can reach — same directory, the name imported, \
+                     or the owning class\nimported. Unlike a production-to-tests/ count it \
+                     also sees phantoms landing inside\nproduction, and needs no \
+                     test/production classification."
+                );
             }
         }
         Commands::Doctor { agent } => {
@@ -1651,6 +1752,7 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
             | Commands::Reinstall { .. }
             | Commands::Uninstall { .. }
             | Commands::Doctor { .. }
+            | Commands::AuditEdges { .. }
             // `Serve` is the hot path used by MCP clients (Claude Code,
             // Codex, etc.). Clients impose a 30 s `initialize` timeout, so
             // every pre-serve startup task — `try_flush` network round-trip,
@@ -1673,6 +1775,7 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
             | Commands::HookPreToolUse
             | Commands::HookPromptSubmit
             | Commands::HookStop
+            | Commands::Hook { .. }
             | Commands::HookKiroPreToolUse
             | Commands::HookKiroPromptSubmit
             | Commands::HookKiroPostToolUse
@@ -1693,6 +1796,13 @@ fn report_local_hook_install(outcome: &tokensave::agents::LocalHookInstall) {
     for name in &outcome.installed {
         eprintln!(
             "\x1b[32m✔\x1b[0m Installed git {name} hook at {}",
+            outcome.hooks_dir.join(name).display()
+        );
+    }
+    for name in &outcome.migrated {
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Updated tokensave's section of the git {name} hook at {} \
+             (your own content in that file was left untouched)",
             outcome.hooks_dir.join(name).display()
         );
     }
@@ -1735,6 +1845,19 @@ fn offer_local_git_hooks(project_path: &std::path::Path, forced: bool, refused: 
         return;
     }
     if !forced && tokensave::agents::local_git_hooks_present(project_path) {
+        // Present, so nothing is installed — but tokensave's own fenced block
+        // may be an older shape than this binary writes. Rewriting it needs no
+        // prompt (#342 Q1): the fence marks the region tokensave owns and
+        // everything outside it is preserved byte-for-byte. Without this, the
+        // early return is exactly the bug the issue describes — a block that
+        // can never be updated after first install.
+        for name in tokensave::agents::migrate_local_hook_blocks(project_path, &current_bin_path())
+        {
+            eprintln!(
+                "\x1b[32m✔\x1b[0m Updated tokensave's section of the git {name} hook \
+                 (your own content in that file was left untouched)"
+            );
+        }
         return;
     }
     if !forced {

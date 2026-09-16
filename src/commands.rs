@@ -80,6 +80,13 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
                 })?,
             };
 
+            // Serialize the copy + metadata phase with the asynchronous
+            // post-checkout hook and transparent auto-track paths. The lock
+            // is deliberately released before the branch's sync below, so
+            // `TokenSave::open` can perform its normal auto-track check.
+            let _branch_lock =
+                tokensave::tokensave::acquire_branch_operation_lock(&tokensave_dir).await?;
+
             // Load or bootstrap metadata
             let mut meta = branch_meta::load_branch_meta(&tokensave_dir).unwrap_or_else(|| {
                 let default = branch::detect_default_branch(&project_path)
@@ -117,6 +124,7 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
             // Save metadata BEFORE open() so it resolves the new branch to its DB
             meta.add_branch(&branch_name, &db_file, &parent);
             branch_meta::save_branch_meta(&tokensave_dir, &meta)?;
+            drop(_branch_lock);
 
             // A sync reads the working directory, so it can only speak for the
             // branch that is actually checked out. Adding some *other* branch
@@ -1023,4 +1031,61 @@ mod skipped_summary_tests {
             "got: {headline}"
         );
     }
+}
+
+/// Handles a git `post-checkout` event (#342 Q1).
+///
+/// This is the branching that used to live inline in the installed hook
+/// script. Moving it into the binary means the hook file itself is one
+/// delegating line that never has to be rewritten again: every later change to
+/// what a checkout triggers ships with the binary. It is also testable here,
+/// which it was not as shell.
+///
+/// The semantics are carried over unchanged:
+///
+/// * git reports the initial checkout of a fresh clone — and of every new
+///   `git worktree add` — by passing the all-zeros sentinel as the previous
+///   HEAD. That checkout is **also** a branch checkout and can land on a
+///   branch that is not the default one (`git clone -b feature`,
+///   `git worktree add -b feature`), so it runs `init` and **then** tracks the
+///   branch. Sequentially, because tracking copies the index `init` creates.
+/// * Any other branch checkout (`branch_flag == "1"`) tracks the
+///   just-checked-out branch alone.
+/// * File checkouts (`branch_flag == "0"`) trigger nothing.
+///
+/// Tracking always goes through the `auto_track` gate (#397), so the knob
+/// stays authoritative on this path. Silent by design and never fails the
+/// checkout: a hook runs on every branch switch and must neither narrate nor
+/// be able to break `git checkout`.
+pub async fn hook_post_checkout(prev_head: Option<&str>, branch_flag: Option<&str>) {
+    use tokensave::agents::hooks::{classify_checkout, CheckoutAction};
+
+    let project_path = tokensave::config::resolve_path(None);
+
+    match classify_checkout(prev_head, branch_flag) {
+        CheckoutAction::InitThenTrack => {
+            // `init` on an already-initialised project returns an error;
+            // either way tracking still runs, matching the shell's
+            // `init || exit 0` followed by the track.
+            let _ = init_and_index(&project_path, &[], false).await;
+            track_current_branch_if_enabled(&project_path).await;
+        }
+        CheckoutAction::TrackOnly => track_current_branch_if_enabled(&project_path).await,
+        CheckoutAction::Nothing => {}
+    }
+}
+
+/// Tracks the current branch when `auto_track` allows it, swallowing every
+/// failure. Shared by both arms of [`hook_post_checkout`].
+async fn track_current_branch_if_enabled(project_path: &std::path::Path) {
+    let config = tokensave::config::load_config(project_path).unwrap_or_default();
+    if !tokensave::config::env_bool_override("TOKENSAVE_AUTO_TRACK", config.auto_track) {
+        return;
+    }
+    let _ = handle_branch_action(BranchAction::Add {
+        name: None,
+        path: Some(project_path.display().to_string()),
+        if_enabled: true,
+    })
+    .await;
 }

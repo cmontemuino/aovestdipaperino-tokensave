@@ -42,14 +42,36 @@ pub(super) async fn handle_str_replace(cg: &TokenSave, args: Value) -> Result<To
             message: "missing required parameter: new_str".to_string(),
         })?;
 
+    let echo = args
+        .get("echo")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let root_override = project_root_arg(&args);
     let result = cg
         .str_replace(path, old_str, new_str, root_override)
         .await?;
     let touched_files = vec![result.file_path.clone()];
+    let mut value = json!({
+        "ok": result.success,
+        "file": path,
+    });
+    if result.success {
+        value["lines"] = json!([result.changed_lines.0, result.changed_lines.1]);
+        value["digest"] = json!(result.digest);
+        if echo {
+            value["matched_str"] = json!(result.matched_str);
+            value["new_str"] = json!(result.new_str);
+        }
+    } else {
+        value["message"] = json!(result.message);
+        if let Some(nearest) = result.nearest {
+            value["nearest"] = json!(nearest);
+        }
+    }
     Ok(ToolResult {
         value: json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }]
         }),
         touched_files,
     })
@@ -129,14 +151,127 @@ pub(super) async fn handle_insert_at(cg: &TokenSave, args: Value) -> Result<Tool
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    let echo = args
+        .get("echo")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let root_override = project_root_arg(&args);
     let result = cg
         .insert_at(path, anchor, content, before, root_override)
         .await?;
     let touched_files = vec![result.file_path.clone()];
+    let mut value = json!({
+        "ok": result.success,
+        "file": result.file_path,
+    });
+    if result.success {
+        value["lines"] = json!([result.changed_lines.0, result.changed_lines.1]);
+        value["digest"] = json!(result.digest);
+        if echo {
+            value["content"] = json!(result.content);
+        }
+    } else {
+        value["message"] = json!(result.message);
+        if let Some(nearest) = result.nearest {
+            value["nearest"] = json!(nearest);
+        }
+    }
     Ok(ToolResult {
         value: json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }]
+        }),
+        touched_files,
+    })
+}
+
+pub(super) async fn handle_delete_symbol(cg: &TokenSave, args: Value) -> Result<ToolResult> {
+    let symbol =
+        args.get("symbol")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| TokenSaveError::Config {
+                message: "missing required parameter: symbol".to_string(),
+            })?;
+    let include_doc_comment = args
+        .get("include_doc_comment")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let root_override = project_root_arg(&args);
+    let result = cg
+        .delete_symbol(symbol, include_doc_comment, root_override)
+        .await?;
+    let touched_files = if result.success {
+        vec![result.file_path.clone()]
+    } else {
+        vec![]
+    };
+    let mut value = json!({ "ok": result.success, "file": result.file_path });
+    if result.success {
+        value["lines"] = json!([result.changed_lines.0, result.changed_lines.1]);
+        value["digest"] = json!(result.digest);
+    } else {
+        value["message"] = json!(result.message);
+    }
+    Ok(ToolResult {
+        value: json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }]
+        }),
+        touched_files,
+    })
+}
+
+pub(super) async fn handle_replace_lines(cg: &TokenSave, args: Value) -> Result<ToolResult> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TokenSaveError::Config {
+            message: "missing required parameter: path".to_string(),
+        })?;
+    let start = args
+        .get("start")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| TokenSaveError::Config {
+            message: "missing required parameter: start".to_string(),
+        })? as u32;
+    let end = args
+        .get("end")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| TokenSaveError::Config {
+            message: "missing required parameter: end".to_string(),
+        })? as u32;
+    let new_content = args
+        .get("new_content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TokenSaveError::Config {
+            message: "missing required parameter: new_content".to_string(),
+        })?;
+    let expected_digest = args.get("expected_digest").and_then(|v| v.as_str());
+    let root_override = project_root_arg(&args);
+    let result = cg
+        .replace_lines(
+            path,
+            start,
+            end,
+            new_content,
+            expected_digest,
+            root_override,
+        )
+        .await?;
+    let touched_files = if result.success {
+        vec![result.file_path.clone()]
+    } else {
+        vec![]
+    };
+    let mut value = json!({ "ok": result.success, "file": path });
+    if result.success {
+        value["lines"] = json!([result.changed_lines.0, result.changed_lines.1]);
+        value["digest"] = json!(result.digest);
+    } else {
+        value["message"] = json!(result.message);
+    }
+    Ok(ToolResult {
+        value: json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }]
         }),
         touched_files,
     })
@@ -156,6 +291,11 @@ pub(super) async fn handle_replace_symbol(cg: &TokenSave, args: Value) -> Result
             message: "missing required parameter: new_source".to_string(),
         })?;
 
+    let echo = args
+        .get("echo")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let root_override = project_root_arg(&args);
     let result = cg.replace_symbol(symbol, new_source, root_override).await?;
     let touched_files = if result.success {
@@ -163,9 +303,26 @@ pub(super) async fn handle_replace_symbol(cg: &TokenSave, args: Value) -> Result
     } else {
         vec![]
     };
+    let mut value = json!({
+        "ok": result.success,
+        "file": result.file_path,
+    });
+    if result.success {
+        value["lines"] = json!([result.changed_lines.0, result.changed_lines.1]);
+        value["digest"] = json!(result.digest);
+        if echo {
+            value["matched_str"] = json!(result.matched_str);
+            value["new_str"] = json!(result.new_str);
+        }
+    } else {
+        value["message"] = json!(result.message);
+        if let Some(nearest) = result.nearest {
+            value["nearest"] = json!(nearest);
+        }
+    }
     Ok(ToolResult {
         value: json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }]
         }),
         touched_files,
     })
@@ -189,6 +346,11 @@ pub(super) async fn handle_insert_at_symbol(cg: &TokenSave, args: Value) -> Resu
         .and_then(|v| v.as_str())
         .unwrap_or("after");
 
+    let echo = args
+        .get("echo")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let root_override = project_root_arg(&args);
     let result = cg
         .insert_at_symbol(symbol, content, position, root_override)
@@ -198,9 +360,25 @@ pub(super) async fn handle_insert_at_symbol(cg: &TokenSave, args: Value) -> Resu
     } else {
         vec![]
     };
+    let mut value = json!({
+        "ok": result.success,
+        "file": result.file_path,
+    });
+    if result.success {
+        value["lines"] = json!([result.changed_lines.0, result.changed_lines.1]);
+        value["digest"] = json!(result.digest);
+        if echo {
+            value["content"] = json!(result.content);
+        }
+    } else {
+        value["message"] = json!(result.message);
+        if let Some(nearest) = result.nearest {
+            value["nearest"] = json!(nearest);
+        }
+    }
     Ok(ToolResult {
         value: json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }]
         }),
         touched_files,
     })

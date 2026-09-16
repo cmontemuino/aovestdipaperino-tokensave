@@ -482,6 +482,50 @@ async fn test_initialize() {
     assert!(resp["result"]["serverInfo"]["version"].is_string());
 }
 
+/// Negotiation (#535 plan, phase 1). `handle_initialize` used to ignore the
+/// client's request entirely and always answer `2024-11-05`; a host that pins a
+/// newer revision and validates the handshake strictly may treat that as an
+/// unagreed downgrade and drop the connection before `tools/list`.
+async fn initialize_with(requested: Value) -> Value {
+    let (_dir, server) = setup_server().await;
+    let responses = run_server_with_messages(
+        server,
+        vec![jsonrpc_request(json!(1), "initialize", requested)],
+    )
+    .await;
+    parse_response(&responses[0])
+}
+
+#[tokio::test]
+async fn initialize_echoes_a_supported_protocol_version() {
+    for requested in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
+        let resp = initialize_with(json!({ "protocolVersion": requested })).await;
+        assert_eq!(
+            resp["result"]["protocolVersion"], requested,
+            "a revision we support must be echoed back, not silently downgraded"
+        );
+    }
+}
+
+#[tokio::test]
+async fn initialize_answers_its_newest_for_an_unsupported_protocol_version() {
+    let resp = initialize_with(json!({ "protocolVersion": "2099-01-01" })).await;
+    assert_eq!(
+        resp["result"]["protocolVersion"], "2025-11-25",
+        "an unknown revision must be answered with our newest so the client can decide"
+    );
+}
+
+#[tokio::test]
+async fn initialize_falls_back_to_the_oldest_when_no_version_is_requested() {
+    // Absent, and present-but-not-a-string: both keep today's lenient clients
+    // byte-identical to the pre-negotiation behaviour.
+    for params in [json!({}), json!({ "protocolVersion": 20251125 })] {
+        let resp = initialize_with(params).await;
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    }
+}
+
 /// The response to a replayed `initialize` must be newline-terminated.
 /// `serve` consumes the first stdin line when it peeks at `initialize.roots`
 /// (#331) and replays it through `handle_and_write`, which wrote the response
@@ -1018,6 +1062,8 @@ async fn selected_context_qualifies_ids_without_rewriting_source_literals() {
         "tokensave_search",
         json!({
             "query": "shared_target",
+            "format": "json",
+            "ids": true,
             "graph_root": selected_dir.path().display().to_string(),
             "graph_branch": "main"
         }),
@@ -1065,6 +1111,7 @@ async fn selected_context_qualifies_ids_without_rewriting_source_literals() {
         json!({
             "file": "src/lib.rs",
             "mode": "full",
+            "format": "json",
             "graph_root": selected_dir.path().display().to_string(),
             "graph_branch": "main"
         }),
@@ -1099,6 +1146,8 @@ async fn cross_project_selected_queries_leave_both_projects_unchanged() {
         "tokensave_search",
         json!({
             "query": "shared_target",
+            "format": "json",
+            "ids": true,
             "graph_root": selected_dir.path().display().to_string(),
             "graph_branch": "main"
         }),
@@ -1532,6 +1581,8 @@ async fn qualified_colliding_id_traversal_isolated_by_root_and_branch() {
         "tokensave_search",
         json!({
             "query": "shared_target",
+            "format": "json",
+            "ids": true,
             "graph_root": first_dir.path().display().to_string(),
             "graph_branch": "main"
         }),
@@ -1543,6 +1594,8 @@ async fn qualified_colliding_id_traversal_isolated_by_root_and_branch() {
         "tokensave_search",
         json!({
             "query": "shared_target",
+            "format": "json",
+            "ids": true,
             "graph_root": second_dir.path().display().to_string(),
             "graph_branch": "main"
         }),
@@ -2419,7 +2472,7 @@ async fn test_cached_read_baseline_is_capped_not_full_file() {
             "tools/call",
             json!({
                 "name": "tokensave_read",
-                "arguments": { "file": "src/main.rs", "mode": "full" }
+                "arguments": { "file": "src/main.rs", "mode": "full", "format": "json" }
             }),
         )
     };
@@ -2448,6 +2501,61 @@ async fn test_cached_read_baseline_is_capped_not_full_file() {
         before < file_tokens / 4,
         "a cache-hit stub must not claim the full file's weight as its \
          baseline: before={before} file_tokens={file_tokens}"
+    );
+}
+
+/// `force: true` bypasses the cross-session cache, so a caller that has not
+/// received this file's body in this session can always ask for it (#556).
+#[tokio::test]
+async fn test_read_force_bypasses_cache() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    let source = "fn main() { let x = helper(); }\nfn helper() -> i32 { 42 }\n";
+    fs::write(project.join("src/main.rs"), source).unwrap();
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+    let server = McpServer::new(cg, None).await;
+
+    let read_call = |id: i64, force: bool| {
+        jsonrpc_request(
+            json!(id),
+            "tools/call",
+            json!({
+                "name": "tokensave_read",
+                "arguments": {
+                    "file": "src/main.rs",
+                    "mode": "full",
+                    "force": force
+                }
+            }),
+        )
+    };
+
+    // First call populates the cache; the second identical call with
+    // `force: true` must still return the body, not an unchanged stub.
+    let responses =
+        run_server_with_messages(server, vec![read_call(91, false), read_call(92, true)]).await;
+
+    let second_resp = responses
+        .iter()
+        .find(|r| parse_response(r)["id"] == 92)
+        .expect("should have a response for id=92");
+    let text = {
+        let resp = parse_response(second_resp);
+        resp["result"]["content"].as_array().unwrap()[0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(
+        text.contains("fn helper"),
+        "forced read must return the body even when the cache holds an \
+         unchanged stub, got: {text}"
+    );
+    assert!(
+        !text.contains("\"unchanged\""),
+        "forced read must not return an unchanged stub, got: {text}"
     );
 }
 
