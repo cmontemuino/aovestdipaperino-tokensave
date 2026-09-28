@@ -24,9 +24,11 @@ use super::graph_scope::{
     select_graph, validate_local_inputs, GraphSelector, FEDERATABLE_TOOLS,
 };
 use super::tools::{
-    baseline_policy, cap_baseline, get_always_load_tool_definitions, get_tool_definitions,
-    handle_tool_call_with_session, is_graph_scoped_tool, is_selectorless_local_graph_tool,
-    request_overhead_tokens, schema_overhead_tokens, settle_session_debt, SessionState,
+    baseline_policy, cap_baseline, get_always_load_tool_definitions, get_listed_tool_definitions,
+    get_tool_definitions, handle_tool_call_with_session, is_graph_scoped_tool,
+    is_selectorless_local_graph_tool, is_tool_area, request_overhead_tokens,
+    schema_overhead_tokens, settle_session_debt, tool_area, SessionState, CORE_TOOLS, MORE_TOOL,
+    TOOL_AREAS,
 };
 use super::transport::{ErrorCode, JsonRpcRequest, JsonRpcResponse};
 
@@ -385,6 +387,9 @@ pub struct McpServer {
     version_cache: std::sync::Mutex<VersionCheckState>,
     /// Pending JSON-RPC notifications to send before the next response.
     pending_notifications: std::sync::Mutex<Vec<Value>>,
+    /// The tool areas that `tokensave_more` listed in this session (#576).
+    /// Only read when the core toolset is active.
+    revealed_areas: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// When the MCP server was started from a subdirectory of the project root,
     /// this holds the relative path prefix (e.g. `"src/mcp"`). Listing tools
     /// use it as the default path filter. `None` when cwd == project root.
@@ -696,6 +701,7 @@ impl McpServer {
                 checked_at: None,
             }),
             pending_notifications: std::sync::Mutex::new(Vec::new()),
+            revealed_areas: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             scope_prefix,
             shutdown_done: AtomicBool::new(false),
             run_started: AtomicBool::new(false),
@@ -887,6 +893,7 @@ impl McpServer {
                 root_args,
                 None,
                 None,
+                true,
                 Some(&self.session_state),
             )
             .await;
@@ -1783,6 +1790,7 @@ impl McpServer {
                 request.params.as_ref(),
                 self.cg.report_savings(),
                 &self.sibling_projects,
+                self.cg.toolset(),
             )),
             "initialized" | "notifications/initialized" | "notifications/roots/list_changed" => {
                 // Known notifications - no response required
@@ -1834,6 +1842,7 @@ impl McpServer {
         params: Option<&Value>,
         report_savings: bool,
         sibling_projects: &[String],
+        toolset: crate::config::Toolset,
     ) -> JsonRpcResponse {
         const BASE_INSTRUCTIONS: &str = "tokensave is a code-graph MCP server. \
             Start with tokensave_context for any code exploration task \
@@ -1848,6 +1857,10 @@ impl McpServer {
              report the savings to the user (e.g. 'TokenSave'd ~N tokens').";
 
         let mut instructions = BASE_INSTRUCTIONS.to_string();
+        // #576: the cross-project rules are sent here once per session. The
+        // `graph_root` description, which a client sends once per tool on
+        // every turn, keeps only one sentence.
+        instructions.push_str(crate::mcp::tools::GRAPH_SELECTOR_INSTRUCTIONS);
         if report_savings {
             instructions.push_str(REPORT_SAVINGS_INSTRUCTION);
         }
@@ -1863,12 +1876,23 @@ impl McpServer {
             );
         }
 
+        // #576: with the core toolset the list grows when `tokensave_more` is
+        // called, so the client must be told that it can change. The full
+        // toolset never changes, and its handshake stays as it was.
+        let core = toolset == crate::config::Toolset::Core;
+        if core {
+            let _ = write!(
+                instructions,
+                " Only the core tools are listed. Call {MORE_TOOL} with an area to list more."
+            );
+        }
+
         JsonRpcResponse::success(
             id,
             json!({
                 "protocolVersion": negotiate_protocol_version(params),
                 "capabilities": {
-                    "tools": {},
+                    "tools": if core { json!({ "listChanged": true }) } else { json!({}) },
                     "resources": {},
                     "logging": {}
                 },
@@ -1881,14 +1905,63 @@ impl McpServer {
         )
     }
 
-    /// Handles the `tools/list` method, returning all available tool definitions.
+    /// Handles the `tools/list` method, returning the tool definitions of the
+    /// configured toolset (#576). A tool that is not listed still answers a
+    /// `tools/call`.
     fn handle_tools_list(&self, id: Value) -> JsonRpcResponse {
-        let tools = get_tool_definitions();
+        let revealed = self
+            .revealed_areas
+            .lock()
+            .map(|areas| areas.clone())
+            .unwrap_or_default();
+        let tools = get_listed_tool_definitions(self.cg.toolset(), &revealed);
         // Marks the schema as actually delivered so `handle_tools_call` knows
         // it's fair to debit `schema_overhead_tokens` against this session —
         // see `schema_served`.
         self.schema_served.store(true, Ordering::Relaxed);
         JsonRpcResponse::success(id, json!({ "tools": tools }))
+    }
+
+    /// Handles `tokensave_more` (#576): lists one more tool area from now on.
+    ///
+    /// This is server state, not a graph query, so it does not go through the
+    /// tool handlers. A new area queues `notifications/tools/list_changed`,
+    /// which the run loop writes before this response, and the client then
+    /// fetches `tools/list` again.
+    fn handle_more(&self, id: Value, arguments: &Value) -> JsonRpcResponse {
+        let area = arguments.get("area").and_then(Value::as_str).unwrap_or("");
+        if !is_tool_area(area) {
+            let names: Vec<&str> = TOOL_AREAS.iter().map(|(name, _, _)| *name).collect();
+            return JsonRpcResponse::error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("unknown area '{area}'. Areas: {}, all", names.join(", ")),
+            );
+        }
+        let text = if self.cg.toolset() == crate::config::Toolset::Full {
+            "All tools are already listed.".to_string()
+        } else {
+            let added = self
+                .revealed_areas
+                .lock()
+                .is_ok_and(|mut areas| areas.insert(area.to_string()));
+            if added {
+                if let Ok(mut pending) = self.pending_notifications.lock() {
+                    pending.push(json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed"
+                    }));
+                }
+            }
+            let names: Vec<String> = get_tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .filter(|name| !CORE_TOOLS.contains(&name.as_str()))
+                .filter(|name| area == "all" || tool_area(name) == area)
+                .collect();
+            format!("Listed from now on ({area}): {}", names.join(", "))
+        };
+        JsonRpcResponse::success(id, json!({ "content": [{ "type": "text", "text": text }] }))
     }
 
     /// Handles the `resources/list` method, returning available resources.
@@ -2192,6 +2265,10 @@ impl McpServer {
             *counts.entry(tool_name.to_string()).or_insert(0) += 1;
         }
 
+        if tool_name == MORE_TOOL {
+            return self.handle_more(id, &arguments);
+        }
+
         let has_selector = arguments.as_object().is_some_and(|object| {
             object.contains_key("graph_root") || object.contains_key("graph_branch")
         });
@@ -2335,6 +2412,7 @@ impl McpServer {
             arguments,
             server_stats,
             scope_prefix,
+            selected.is_some(),
             Some(&self.session_state),
         )
         .await;

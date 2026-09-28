@@ -63,6 +63,52 @@ fn def_always_load(
     }
 }
 
+/// `graph_root` description for a tool that answers about one graph.
+///
+/// It used to be one 457-byte paragraph repeated verbatim on every one of the
+/// 53 graph-scoped tools, re-sent every turn before any tool is called
+/// (#576). Each description is now one sentence; the full cross-project rules
+/// go once per session in [`GRAPH_SELECTOR_INSTRUCTIONS`]. Only the tools in
+/// [`FEDERATABLE_TOOLS`](crate::mcp::graph_scope::FEDERATABLE_TOOLS) mention
+/// the array form, because only they accept it.
+///
+/// The schema keeps `anyOf` everywhere: an array reaching a single-graph tool
+/// is rejected at the call with a message that names the tools that accept
+/// one, and narrowing the schema instead would turn that into an opaque
+/// validation error.
+///
+/// Like [`CONTEXT_DESCRIPTION`], these must stay constant: a changed byte
+/// invalidates the client's cached prompt prefix.
+const GRAPH_ROOT_DESCRIPTION: &str =
+    "Absolute root of another initialized project to query. Omit for the served project.";
+
+/// `graph_root` description for the tools that accept an array of roots.
+const GRAPH_ROOT_FEDERATED_DESCRIPTION: &str =
+    "Absolute root of another initialized project to query, or an array of roots to query \
+     together. Omit for the served project.";
+
+/// `graph_branch` description.
+const GRAPH_BRANCH_DESCRIPTION: &str =
+    "Tracked branch to query within graph_root. Requires graph_root.";
+
+/// The cross-project rules that the `graph_root` descriptions no longer carry
+/// (#576). The server sends this once per session in its instructions.
+pub const GRAPH_SELECTOR_INSTRUCTIONS: &str =
+    " A tool with a graph_root parameter can query another initialized project: pass that \
+     project's absolute root, and graph_branch to select one of its tracked branches. \
+     tokensave_search and tokensave_files also accept an array of roots and answer across all \
+     of them at once, interleaving results by rank; roots that are worktrees of a repository \
+     already named are collapsed, and the response says which. Every other tool answers about \
+     a single graph and rejects an array.";
+
+fn graph_root_description(tool: &str) -> &'static str {
+    if crate::mcp::graph_scope::FEDERATABLE_TOOLS.contains(&tool) {
+        GRAPH_ROOT_FEDERATED_DESCRIPTION
+    } else {
+        GRAPH_ROOT_DESCRIPTION
+    }
+}
+
 /// Add the explicit selectors and metadata used by tools that can query any
 /// initialized graph.
 fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
@@ -85,20 +131,14 @@ fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
                 { "type": "string" },
                 { "type": "array", "items": { "type": "string" } }
             ],
-            "description": "Exact absolute initialized project root to query. Omit to query \
-             the project this server already serves; when present it must name a different \
-             project. `tokensave_search` and `tokensave_files` also accept an array of roots \
-             and answer across all of them at once, interleaving results by rank; roots that \
-             are worktrees of a repository already named are collapsed, and the response says \
-             which. Every other tool answers about a single graph and rejects an array."
+            "description": graph_root_description(&definition.name)
         }),
     );
     properties.insert(
         "graph_branch".to_string(),
         json!({
             "type": "string",
-            "description": "Exact tracked branch to query within graph_root. Requires \
-             graph_root."
+            "description": GRAPH_BRANCH_DESCRIPTION
         }),
     );
 
@@ -280,6 +320,189 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         definitions.iter().all(|d| d.name.starts_with("tokensave_")),
         "all tool definitions must have 'tokensave_' prefix"
     );
+    definitions
+}
+
+/// The tools that [`Toolset::Core`](crate::config::Toolset::Core) lists (#576).
+///
+/// Exploration (`context`, `search`, `status`), reading (`read`, `body`,
+/// `files`), the call graph (`callers`, `callees`, `impact`) and the two
+/// string edits. Every `anthropic/alwaysLoad` tool must be here: those are the
+/// tools the server instructions send an agent to first.
+pub const CORE_TOOLS: &[&str] = &[
+    "tokensave_context",
+    "tokensave_search",
+    "tokensave_status",
+    "tokensave_read",
+    "tokensave_body",
+    "tokensave_files",
+    "tokensave_callers",
+    "tokensave_callees",
+    "tokensave_impact",
+    "tokensave_str_replace",
+    "tokensave_multi_str_replace",
+];
+
+/// The tool that lists more tools when the core toolset is active (#576).
+pub const MORE_TOOL: &str = "tokensave_more";
+
+/// The areas that [`MORE_TOOL`] can list: name, summary, tools.
+///
+/// The last area has no tool list. It is the catch-all: a tool that is not in
+/// [`CORE_TOOLS`] and not named by another area belongs to it, so a new tool
+/// is reachable without an edit here.
+pub const TOOL_AREAS: &[(&str, &str, &[&str])] = &[
+    (
+        "analysis",
+        "code-quality metrics and audits: complexity, coupling, cycles, dead code, hotspots, \
+         health, test risk and coverage, diagnostics, package dependencies",
+        &[
+            "tokensave_gini",
+            "tokensave_god_class",
+            "tokensave_dsm",
+            "tokensave_distribution",
+            "tokensave_redundancy",
+            "tokensave_hotspots",
+            "tokensave_complexity",
+            "tokensave_coupling",
+            "tokensave_circular",
+            "tokensave_largest",
+            "tokensave_rank",
+            "tokensave_health",
+            "tokensave_doc_coverage",
+            "tokensave_recursion",
+            "tokensave_test_risk",
+            "tokensave_test_coverage",
+            "tokensave_test_map",
+            "tokensave_simplify_scan",
+            "tokensave_unsafe_patterns",
+            "tokensave_dead_code",
+            "tokensave_unused_imports",
+            "tokensave_todos",
+            "tokensave_diagnostics",
+            "tokensave_diagnose",
+            "tokensave_inheritance_depth",
+            "tokensave_dependency_depth",
+            "tokensave_dependencies",
+        ],
+    ),
+    (
+        "edit",
+        "symbol-level and line-level edits, ast-grep rewrite, rename preview",
+        &[
+            "tokensave_insert_at",
+            "tokensave_delete_symbol",
+            "tokensave_replace_lines",
+            "tokensave_ast_grep_rewrite",
+            "tokensave_replace_symbol",
+            "tokensave_insert_at_symbol",
+            "tokensave_rename_preview",
+        ],
+    ),
+    (
+        "git",
+        "commit, PR, diff, blame, log and changelog context, affected tests, tracked branches",
+        &[
+            "tokensave_changelog",
+            "tokensave_commit_context",
+            "tokensave_pr_context",
+            "tokensave_diff_context",
+            "tokensave_diff",
+            "tokensave_blame",
+            "tokensave_log",
+            "tokensave_affected",
+            "tokensave_run_affected_tests",
+            "tokensave_branch_search",
+            "tokensave_branch_diff",
+            "tokensave_branch_list",
+        ],
+    ),
+    (
+        "memory",
+        "session notes and recorded decisions",
+        &[
+            "tokensave_session_start",
+            "tokensave_session_end",
+            "tokensave_session_recall",
+            "tokensave_record_decision",
+            "tokensave_record_code_area",
+        ],
+    ),
+    (
+        "navigate",
+        "more symbol lookups: node, signature, implementations, type hierarchy, imports, \
+         call chains, field and constructor sites",
+        &[],
+    ),
+];
+
+/// The area of a tool that is not in [`CORE_TOOLS`].
+pub fn tool_area(name: &str) -> &'static str {
+    TOOL_AREAS
+        .iter()
+        .find(|(_, _, tools)| tools.contains(&name))
+        .or(TOOL_AREAS.last())
+        .map_or("navigate", |(area, _, _)| area)
+}
+
+/// True when `area` is `"all"` or the name of an entry in [`TOOL_AREAS`].
+pub fn is_tool_area(area: &str) -> bool {
+    area == "all" || TOOL_AREAS.iter().any(|(name, _, _)| *name == area)
+}
+
+fn def_more() -> ToolDefinition {
+    use std::fmt::Write;
+    let mut description = "List more tokensave tools. Only the core tools are listed at the \
+                           start, to keep the tool schemas small. Call this with an area, and \
+                           the tools of that area are listed from then on. Areas:"
+        .to_string();
+    let mut areas: Vec<&str> = Vec::new();
+    for (area, summary, _) in TOOL_AREAS {
+        let _ = write!(description, "\n• {area} — {summary}");
+        areas.push(area);
+    }
+    areas.push("all");
+    def(
+        MORE_TOOL,
+        "List More Tools",
+        &description,
+        json!({
+            "type": "object",
+            "properties": {
+                "area": { "type": "string", "enum": areas, "description": "The area to list, or \"all\"." }
+            },
+            "required": ["area"]
+        }),
+    )
+}
+
+/// Returns the tool definitions that `tools/list` sends for `toolset`.
+///
+/// [`get_tool_definitions`] stays the source of truth for everything else
+/// (dispatch, permission lists, the branch-drift gate): a tool that is not
+/// listed is hidden, not removed.
+///
+/// With [`Toolset::Core`](crate::config::Toolset::Core) the list is the core
+/// tools, the tools of each area in `revealed_areas`, and [`MORE_TOOL`] while
+/// an area is still hidden.
+pub fn get_listed_tool_definitions(
+    toolset: crate::config::Toolset,
+    revealed_areas: &std::collections::BTreeSet<String>,
+) -> Vec<ToolDefinition> {
+    let mut definitions = get_tool_definitions();
+    if toolset == crate::config::Toolset::Full {
+        return definitions;
+    }
+    let all = revealed_areas.contains("all")
+        || TOOL_AREAS
+            .iter()
+            .all(|(area, _, _)| revealed_areas.contains(*area));
+    if !all {
+        definitions.retain(|d| {
+            CORE_TOOLS.contains(&d.name.as_str()) || revealed_areas.contains(tool_area(&d.name))
+        });
+        definitions.push(def_more());
+    }
     definitions
 }
 
@@ -1473,7 +1696,7 @@ fn def_str_replace() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
                 },
                 "echo": {
                     "type": "boolean",
@@ -1513,7 +1736,7 @@ fn def_multi_str_replace() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
                 }
             },
             "required": ["path", "replacements"]
@@ -1551,7 +1774,7 @@ fn def_insert_at() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
                 },
                 "echo": {
                     "type": "boolean",
@@ -1840,39 +2063,20 @@ fn def_dependencies() -> ToolDefinition {
     def(
         "tokensave_dependencies",
         "Package Dependencies",
-        "Inspect declared dependencies across all supported package ecosystems \
-         (#105, #106). Auto-detects which manifest(s) live at the project root:\n\
-         • Rust — Cargo.toml (+ workspace members glob, [target.<cfg>] deps, [patch.*]) + Cargo.lock\n\
-         • Node — package.json (+ npm/yarn/pnpm workspaces) + package-lock.json / yarn.lock / pnpm-lock.yaml\n\
-         • Python — pyproject.toml (PEP 621 + Poetry), requirements*.txt + poetry.lock / uv.lock / Pipfile.lock\n\
-         • Go — go.mod (require blocks, replace directives) + go.sum\n\
-         • Java — pom.xml (+ <modules> + <dependencyManagement> BOMs)\n\
-         • .NET — *.csproj/*.fsproj/*.vbproj + Directory.Packages.props + packages.lock.json\n\
-         • PHP — composer.json + composer.lock\n\
-         • Ruby — Gemfile + Gemfile.lock\n\
-         • Swift — Package.swift\n\
-         • Elixir — mix.exs\n\
-         • Erlang — rebar.config\n\
-         • R — DESCRIPTION\n\
-         • Haskell — *.cabal\n\
-         • OCaml — *.opam (+ dune-project fallback)\n\
-         • Dart/Flutter — pubspec.yaml + pubspec.lock\n\
-         • Crystal — shard.yml + shard.lock\n\
-         • Gradle — build.gradle (Groovy), build.gradle.kts (Kotlin), \
-         gradle/libs.versions.toml (Version Catalog), settings.gradle{,.kts} \
-         for multi-module discovery\n\n\
+        "Inspect declared dependencies. Auto-detects the manifests at the project root and in \
+         its workspace members for Rust, Node, Python, Go, Java (Maven), Gradle, .NET, PHP, Ruby, \
+         Swift, Elixir, Erlang, R, Haskell, OCaml, Dart/Flutter and Crystal. Polyglot repos \
+         return one block per ecosystem.\n\n\
          Three modes:\n\
          • zero input → workspace summary: members + every package any member \
-         depends on, plus `licenses` aggregate, `version_drift` array (crates \
+         depends on, plus `licenses` aggregate, `version_drift` array (packages \
          pinned at different versions across members), and `members_detail` \
-         with per-member license. Polyglot repos return one block per ecosystem.\n\
+         with per-member license.\n\
          • `crate: <name>` (or `package: <name>`) → list every member that \
          depends on this package, with kind/version/resolved/features/optional/local-path.\n\
          • `member: <name>` → list every dependency declared by this member.\n\n\
-         Filters: `ecosystem: rust|node|python|go|java|dotnet|php|ruby|swift|elixir|erlang|r|haskell|ocaml|dart|crystal|gradle`, \
-         `kind: normal|dev|build|peer|optional|all`. Set `include_lockfile: true` \
-         to stamp resolved versions from the per-ecosystem lockfile. Workspace \
-         globs support `crates/*`, `packages/*/foo`, `**`, and `!negation`.",
+         Filters: `ecosystem`, `kind`. Set `include_lockfile: true` to stamp resolved \
+         versions from the per-ecosystem lockfile.",
         json!({
             "type": "object",
             "properties": {
@@ -1894,11 +2098,11 @@ fn def_dependencies() -> ToolDefinition {
                 },
                 "ecosystem": {
                     "type": "string",
-                    "description": "Restrict to one ecosystem: \"rust\" / \"node\" / \"python\" / \"go\" / \"java\" / \"dotnet\" / \"php\" / \"ruby\"."
+                    "description": "Restrict to one ecosystem: rust, node, python, go, java, dotnet, php, ruby, swift, elixir, erlang, r, haskell, ocaml, dart, crystal or gradle."
                 },
                 "include_lockfile": {
                     "type": "boolean",
-                    "description": "When true, read the per-ecosystem lockfile (Cargo.lock, package-lock.json/yarn.lock, poetry.lock/uv.lock/Pipfile.lock, go.sum, packages.lock.json, composer.lock, Gemfile.lock) and add `resolved` versions alongside declared `version` ranges. Default false."
+                    "description": "When true, read each ecosystem's lockfile and add `resolved` versions alongside declared `version` ranges. Default false."
                 }
             }
         }),
@@ -2039,7 +2243,7 @@ fn def_ast_grep_rewrite() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
                 }
             },
             "required": ["path", "pattern", "rewrite"]
@@ -2285,7 +2489,7 @@ fn def_field_sites() -> ToolDefinition {
             "properties": {
                 "field": {
                     "type": "string",
-                    "description": "Field name. Bare name ('last_sync_at') matches across structs. The qualified form ('GraphStats::last_sync_at') narrows to that struct's field; sites whose receiver cannot be typed are reported in unattributed_count rather than listed, so a narrowed result is a lower bound."
+                    "description": "Field name. Bare name ('last_sync_at') matches across structs. The qualified form ('GraphStats::last_sync_at') narrows to that struct's field."
                 },
                 "writes_only": {
                     "type": "boolean",
@@ -2415,8 +2619,7 @@ fn def_diagnostics() -> ToolDefinition {
          TypeScript, pyright for Python) and return structured errors and \
          warnings. Each diagnostic includes file, line range, level, code, \
          message, driver, and the enclosing graph node when one can be \
-         resolved. Replaces the recurring 'run cargo → parse text → read \
-         file' loop with a single structured response. \
+         resolved. \
          \n\nNote: the cargo target dir is forced to .tokensave/target/ so \
          we don't race with the user's interactive cargo runs. The first \
          call against a fresh tree builds dependencies from scratch, which \
@@ -2649,7 +2852,7 @@ fn def_replace_symbol() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory the symbol's (index-relative) file path is resolved against instead of the indexed project root. Use this when calling from a git worktree that shares the same relative layout but lives at a different absolute location, so the write lands in the worktree, not the primary checkout. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve the symbol's index-relative file path against instead of the indexed project root, e.g. a git worktree with the same layout. Alias: `cwd`."
                 },
                 "echo": {
                     "type": "boolean",
@@ -2712,7 +2915,7 @@ fn def_insert_at_symbol() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory the symbol's (index-relative) file path is resolved against instead of the indexed project root. Use this when calling from a git worktree that shares the same relative layout but lives at a different absolute location, so the write lands in the worktree, not the primary checkout. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve the symbol's index-relative file path against instead of the indexed project root, e.g. a git worktree with the same layout. Alias: `cwd`."
                 },
                 "echo": {
                     "type": "boolean",
@@ -2898,6 +3101,117 @@ mod tests {
         tools
     }
 
+    /// #576: a client sends every tool description on every turn, so a long
+    /// one is a fixed cost for the whole session. `tokensave_dependencies`
+    /// was 1.9 KB because it listed every manifest and lockfile name. Details
+    /// like that belong in the tool result or in the parameter that needs them.
+    #[test]
+    fn tool_descriptions_stay_within_their_byte_budget() {
+        for definition in get_tool_definitions() {
+            assert!(
+                definition.description.len() <= 1200,
+                "{} description is {} bytes",
+                definition.name,
+                definition.description.len()
+            );
+        }
+    }
+
+    /// #576: the core toolset lists exactly `CORE_TOOLS`, every name in it is a
+    /// real tool, and it keeps every tool the instructions point an agent at.
+    #[test]
+    fn the_core_toolset_lists_only_the_core_tools() {
+        use crate::config::Toolset;
+        let all = get_tool_definitions();
+        for name in CORE_TOOLS {
+            assert!(all.iter().any(|d| d.name == *name), "{name} is not a tool");
+        }
+        let none = std::collections::BTreeSet::new();
+        let core = get_listed_tool_definitions(Toolset::Core, &none);
+        assert_eq!(core.len(), CORE_TOOLS.len() + 1);
+        assert!(core
+            .iter()
+            .all(|d| CORE_TOOLS.contains(&d.name.as_str()) || d.name == MORE_TOOL));
+        for definition in get_always_load_tool_definitions() {
+            assert!(
+                CORE_TOOLS.contains(&definition.name.as_str()),
+                "{} is alwaysLoad but not core",
+                definition.name
+            );
+        }
+        assert_eq!(
+            get_listed_tool_definitions(Toolset::Full, &none).len(),
+            all.len()
+        );
+    }
+
+    /// #576: each area names real tools only, no tool is in two areas or in
+    /// the core set as well, and the areas together reach every tool. When
+    /// every area is listed the list equals the full one, without `MORE_TOOL`.
+    #[test]
+    fn the_tool_areas_partition_the_tools_outside_the_core_set() {
+        use crate::config::Toolset;
+        use std::collections::BTreeSet;
+        let all = get_tool_definitions();
+        let mut seen = BTreeSet::new();
+        for (area, _, tools) in TOOL_AREAS {
+            for tool in *tools {
+                // Registered only when the `ast-grep` binary is on PATH.
+                if *tool == "tokensave_ast_grep_rewrite" && !ast_grep_available() {
+                    continue;
+                }
+                assert!(
+                    all.iter().any(|d| d.name == *tool),
+                    "{area}: {tool} is not a tool"
+                );
+                assert!(!CORE_TOOLS.contains(tool), "{tool} is core and in {area}");
+                assert!(seen.insert(*tool), "{tool} is in two areas");
+                assert_eq!(tool_area(tool), *area);
+            }
+        }
+        assert_eq!(tool_area("tokensave_node"), "navigate");
+        assert!(is_tool_area("all") && is_tool_area("git") && !is_tool_area("nope"));
+
+        let mut total = CORE_TOOLS.len();
+        for (area, _, _) in TOOL_AREAS {
+            let one = BTreeSet::from([(*area).to_string()]);
+            let listed = get_listed_tool_definitions(Toolset::Core, &one);
+            assert!(listed.iter().any(|d| d.name == MORE_TOOL));
+            total += listed.len() - CORE_TOOLS.len() - 1;
+        }
+        assert_eq!(total, all.len(), "the areas must reach every tool once");
+
+        let everything = BTreeSet::from(["all".to_string()]);
+        let listed = get_listed_tool_definitions(Toolset::Core, &everything);
+        assert_eq!(listed.len(), all.len());
+        assert!(listed.iter().all(|d| d.name != MORE_TOOL));
+    }
+
+    /// #576: the selector docs are copied into every graph-scoped schema, so
+    /// their size is multiplied by the number of such tools on every turn.
+    /// Hold the short form to a budget, and make sure the rules it dropped
+    /// are still sent once in the server instructions.
+    #[test]
+    fn graph_selector_docs_stay_within_their_byte_budget() {
+        for text in [
+            GRAPH_ROOT_DESCRIPTION,
+            GRAPH_ROOT_FEDERATED_DESCRIPTION,
+            GRAPH_BRANCH_DESCRIPTION,
+        ] {
+            assert!(text.len() <= 130, "{} bytes: {text}", text.len());
+        }
+        assert!(GRAPH_ROOT_FEDERATED_DESCRIPTION.contains("array of roots"));
+        assert!(!GRAPH_ROOT_DESCRIPTION.contains("array"));
+        for rule in [
+            "array of roots",
+            "worktrees",
+            "rejects an array",
+            "graph_branch",
+        ] {
+            assert!(GRAPH_SELECTOR_INSTRUCTIONS.contains(rule), "{rule}");
+        }
+    }
+
     #[test]
     fn graph_scoped_defs_match_the_canonical_set() {
         let canonical = canonical_graph_scoped_tools();
@@ -2952,13 +3266,21 @@ mod tests {
                 );
                 assert_eq!(
                     graph_root.unwrap()["description"],
-                    "Exact absolute initialized project root to query. Omit to query the \
-                     project this server already serves; when present it must name a different \
-                     project. `tokensave_search` and `tokensave_files` also accept an array of \
-                     roots and answer across all of them at once, interleaving results by rank; \
-                     roots that are worktrees of a repository already named are collapsed, and \
-                     the response says which. Every other tool answers about a single graph and \
-                     rejects an array.",
+                    super::graph_root_description(&definition.name),
+                    "{}",
+                    definition.name
+                );
+                // #576: the array rule reaches only the two tools that honour
+                // it, so the other 51 do not pay for it on every turn.
+                assert_eq!(
+                    graph_root.unwrap()["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("array"),
+                    matches!(
+                        definition.name.as_str(),
+                        "tokensave_search" | "tokensave_files"
+                    ),
                     "{}",
                     definition.name
                 );
@@ -2970,7 +3292,7 @@ mod tests {
                 );
                 assert_eq!(
                     graph_branch.unwrap()["description"],
-                    "Exact tracked branch to query within graph_root. Requires graph_root.",
+                    GRAPH_BRANCH_DESCRIPTION,
                     "{}",
                     definition.name
                 );

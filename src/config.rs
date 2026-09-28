@@ -28,6 +28,33 @@ fn default_docs_dir() -> String {
     crate::docs::DEFAULT_DOCS_DIR.to_string()
 }
 
+/// The set of tools the MCP server lists in `tools/list` (#576).
+///
+/// This selects what the server *lists*, not what it can run: a tool outside
+/// the listed set still answers a `tools/call` by name. Hiding a tool must not
+/// break an agent permission list or a hook that names it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Toolset {
+    /// Every tool. The default, so an upgrade changes nothing.
+    #[default]
+    Full,
+    /// Only the tools in `CORE_TOOLS` (see `mcp::tools`).
+    Core,
+}
+
+impl Toolset {
+    /// Parses a `TOKENSAVE_TOOLS` value. Returns `None` for a value that names
+    /// no toolset, so the caller can keep the configured one.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "core" => Some(Self::Core),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenSaveConfig {
     /// Schema version of the configuration.
@@ -41,6 +68,12 @@ pub struct TokenSaveConfig {
     /// files under `.github/` that would otherwise be skipped.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Glob patterns for paths to index even when a `.gitignore` rule covers
+    /// them (#571). Scoped to the listed globs: nothing else is un-ignored.
+    /// Unlike `include`, this also admits hidden paths the glob names. An
+    /// `exclude` glob still wins, and the size limit still applies.
+    #[serde(default)]
+    pub force_include: Vec<String>,
     /// Maximum file size in bytes; files larger than this are skipped.
     pub max_file_size: u64,
     /// Whether to extract doc comments from source files.
@@ -148,6 +181,15 @@ pub struct TokenSaveConfig {
     /// instead of on every server start.
     #[serde(default)]
     pub suppress_scope_warning: bool,
+    /// Which tools the MCP server lists in `tools/list` (#576). Defaults to
+    /// [`Toolset::Full`]. The `TOKENSAVE_TOOLS` env var overrides this per-run.
+    ///
+    /// A client sends every listed tool schema on every turn, before any tool
+    /// is called, so the full surface is a fixed cost of the context window.
+    /// On a small-context model that cost can be more than half the window.
+    /// [`Toolset::Core`] lists only the tools most sessions use.
+    #[serde(default)]
+    pub tools: Toolset,
 }
 
 /// Serde default for [`TokenSaveConfig::artifact_extensions`].
@@ -218,6 +260,7 @@ impl Default for TokenSaveConfig {
                 "bin/**".to_string(),
             ],
             include: Vec::new(),
+            force_include: Vec::new(),
             max_file_size: 1_048_576,
             extract_docstrings: true,
             track_call_sites: true,
@@ -233,6 +276,7 @@ impl Default for TokenSaveConfig {
             report_savings: default_report_savings(),
             artifact_extensions: default_artifact_extensions(),
             suppress_scope_warning: false,
+            tools: Toolset::default(),
         }
     }
 }
@@ -642,6 +686,30 @@ pub fn is_included(path: &str, config: &TokenSaveConfig) -> bool {
     false
 }
 
+/// Returns `true` if `path` matches a `force_include` glob (#571).
+pub fn is_force_included(path: &str, config: &TokenSaveConfig) -> bool {
+    let match_opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    config.force_include.iter().any(|pattern_str| {
+        Pattern::new(pattern_str).is_ok_and(|pattern| pattern.matches_with(path, match_opts))
+    })
+}
+
+/// The directory a `force_include` walk starts from: the glob's leading
+/// components up to the first one holding a glob metacharacter, so
+/// `some/dir/**` walks only `some/dir` rather than the whole project.
+pub fn force_include_base(pattern: &str) -> String {
+    pattern
+        .split('/')
+        .take_while(|part| !part.contains(['*', '?', '[', '{']))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Returns `true` if a directory should be pruned during scanning.
 ///
 /// Matches `dir/_` against exclude patterns (for `dir/**`-style globs) and
@@ -822,6 +890,15 @@ mod tests {
     fn test_is_included_empty_matches_nothing() {
         let config = TokenSaveConfig::default();
         assert!(!is_included(".github/workflows/ci.yml", &config));
+    }
+
+    #[test]
+    fn force_include_base_stops_at_the_first_glob_component() {
+        assert_eq!(super::force_include_base("some/dir/**"), "some/dir");
+        assert_eq!(super::force_include_base("some/*/gen/**"), "some");
+        assert_eq!(super::force_include_base("docs/api.md"), "docs/api.md");
+        assert_eq!(super::force_include_base("**/generated/**"), "");
+        assert_eq!(super::force_include_base("src/{a,b}/**"), "src");
     }
 
     #[test]
