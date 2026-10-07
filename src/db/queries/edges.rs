@@ -6,6 +6,78 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 impl Database {
+    /// Link later Ruby declarations to a stable representative of the same constant.
+    /// Keep declaration nodes separate so their source locations and members survive.
+    /// Recomputing the full relation after each Ruby change also repairs links after deletions and moves.
+    pub async fn rebuild_ruby_reopenings(&self) -> Result<()> {
+        let _write_guard = self.write_lock.lock().await;
+        self.conn()
+            .execute("BEGIN", ())
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to begin Ruby reopening rebuild: {e}"),
+                operation: "rebuild_ruby_reopenings".to_string(),
+            })?;
+
+        // Ruby extraction currently writes file::file::name; the single-prefix branch accepts older or alternate rows, and ltrim removes the absolute :: marker from names such as class ::Entry.
+        let result = async {
+            self.conn()
+                .execute("DELETE FROM edges WHERE kind = 'reopens'", ())
+                .await?;
+            self.conn()
+                .execute(
+                    "INSERT INTO edges (source, target, kind, line)
+                     SELECT id, canonical_id, 'reopens', start_line
+                     FROM (
+                         SELECT id, start_line,
+                                FIRST_VALUE(id) OVER declaration AS canonical_id,
+                                ROW_NUMBER() OVER declaration AS declaration_number
+                         FROM (
+                             SELECT id, kind, file_path, start_line, start_column,
+                                    ltrim(CASE
+                                        WHEN substr(qualified_name, 1, length(file_path) * 2 + 4) = file_path || '::' || file_path || '::'
+                                        THEN substr(qualified_name, length(file_path) * 2 + 5)
+                                        ELSE substr(qualified_name, length(file_path) + 3)
+                                    END, ':') AS constant_name
+                             FROM nodes
+                             WHERE kind IN ('class', 'module')
+                               AND (file_path LIKE '%.rb' OR file_path LIKE '%.rake' OR file_path LIKE '%.erb' OR file_path LIKE '%.slim')
+                               AND qualified_name NOT LIKE '%<anonymous>%'
+                               AND substr(qualified_name, 1, length(file_path) + 2) = file_path || '::'
+                         )
+                         WINDOW declaration AS (
+                             PARTITION BY kind, constant_name
+                             ORDER BY file_path, start_line, start_column, id
+                         )
+                     )
+                     WHERE declaration_number > 1",
+                    (),
+                )
+                .await?;
+            Ok::<(), libsql::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => self
+                .conn()
+                .execute("COMMIT", ())
+                .await
+                .map(|_| ())
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to commit Ruby reopening rebuild: {e}"),
+                    operation: "rebuild_ruby_reopenings".to_string(),
+                }),
+            Err(e) => {
+                let _ = self.conn().execute("ROLLBACK", ()).await;
+                Err(TokenSaveError::Database {
+                    message: format!("failed to rebuild Ruby reopenings: {e}"),
+                    operation: "rebuild_ruby_reopenings".to_string(),
+                })
+            }
+        }
+    }
+
     /// Inserts a single edge, skipping silently if either endpoint is missing.
     pub async fn insert_edge(&self, edge: &Edge) -> Result<()> {
         // Contains is denormalized to nodes.parent_id since v9. Fold the
@@ -25,15 +97,18 @@ impl Database {
         }
         self.conn()
             .execute(
-                "INSERT OR IGNORE INTO edges (source, target, kind, line) \
-                 SELECT ?1, ?2, ?3, ?4 \
-                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
-                   AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2)",
+                &format!(
+                    "INSERT INTO edges (source, target, kind, line, resolved_by) \
+                     SELECT ?1, ?2, ?3, ?4, ?5 \
+                     WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
+                       AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2){EDGE_UPSERT_CLAUSE}"
+                ),
                 params![
                     edge.source.as_str(),
                     edge.target.as_str(),
                     edge.kind.as_str(),
-                    edge.line.map(i64::from)
+                    edge.line.map(i64::from),
+                    edge.resolved_by.map(ResolvedBy::code)
                 ],
             )
             .await
@@ -69,12 +144,12 @@ impl Database {
         // when an edge references a node from a not-yet-indexed file.
         let stmt = self
             .conn()
-            .prepare(
-                "INSERT OR IGNORE INTO edges (source, target, kind, line) \
-                 SELECT ?1, ?2, ?3, ?4 \
-                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
-                   AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2)",
-            )
+            .prepare(&format!(
+                "INSERT INTO edges (source, target, kind, line, resolved_by) \
+                     SELECT ?1, ?2, ?3, ?4, ?5 \
+                     WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
+                       AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2){EDGE_UPSERT_CLAUSE}"
+            ))
             .await
             .map_err(|e| TokenSaveError::Database {
                 message: format!("failed to prepare: {e}"),
@@ -107,6 +182,7 @@ impl Database {
                 edge.target.as_str(),
                 edge.kind.as_str(),
                 edge.line.map(i64::from),
+                edge.resolved_by.map(ResolvedBy::code),
             ])
             .await
             .map_err(|e| TokenSaveError::Database {
@@ -139,7 +215,7 @@ impl Database {
             let mut rows = self
                 .conn()
                 .query(
-                    "SELECT source, target, kind, line FROM edges WHERE source = ?1",
+                    "SELECT source, target, kind, line, resolved_by FROM edges WHERE source = ?1",
                     params![source_id],
                 )
                 .await
@@ -156,7 +232,7 @@ impl Database {
                 .map(|(i, _)| format!("?{}", i + 2))
                 .collect();
             let sql = format!(
-                "SELECT source, target, kind, line FROM edges WHERE source = ?1 AND kind IN ({})",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE source = ?1 AND kind IN ({})",
                 placeholders.join(", ")
             );
 
@@ -191,7 +267,7 @@ impl Database {
             let mut rows = self
                 .conn()
                 .query(
-                    "SELECT source, target, kind, line FROM edges WHERE target = ?1",
+                    "SELECT source, target, kind, line, resolved_by FROM edges WHERE target = ?1",
                     params![target_id],
                 )
                 .await
@@ -208,7 +284,7 @@ impl Database {
                 .map(|(i, _)| format!("?{}", i + 2))
                 .collect();
             let sql = format!(
-                "SELECT source, target, kind, line FROM edges WHERE target = ?1 AND kind IN ({})",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE target = ?1 AND kind IN ({})",
                 placeholders.join(", ")
             );
 
@@ -322,6 +398,7 @@ impl Database {
                 target: trait_method_id.clone(),
                 kind: EdgeKind::Calls,
                 line: (stored_line >= 0).then_some(stored_line as u32),
+                resolved_by: None,
             };
             callers.entry(concrete_method_id).or_default().push((
                 caller,
@@ -381,7 +458,7 @@ impl Database {
 
         let sql = if kinds.is_empty() {
             format!(
-                "SELECT source, target, kind, line FROM edges WHERE target IN ({})",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE target IN ({})",
                 target_placeholders.join(", ")
             )
         } else {
@@ -392,7 +469,7 @@ impl Database {
                 param_values.push(libsql::Value::Text(k.as_str().to_string()));
             }
             format!(
-                "SELECT source, target, kind, line FROM edges \
+                "SELECT source, target, kind, line, resolved_by FROM edges \
                  WHERE target IN ({}) AND kind IN ({})",
                 target_placeholders.join(", "),
                 kind_placeholders.join(", ")
@@ -722,9 +799,9 @@ impl Database {
                         start_line, end_line, start_column, end_column,
                         docstring, signature, visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
                  FROM nodes
-                 WHERE qualified_name LIKE ?1
+                 WHERE qualified_name LIKE ?1 ESCAPE '\\'
                  LIMIT 50",
-                format!("%::{qname}"),
+                format!("%::{}", escape_like(qname)),
             )
         } else {
             (
@@ -1458,7 +1535,10 @@ impl Database {
     pub async fn get_all_edges(&self) -> Result<Vec<Edge>> {
         let mut rows = self
             .conn()
-            .query("SELECT source, target, kind, line FROM edges", ())
+            .query(
+                "SELECT source, target, kind, line, resolved_by FROM edges",
+                (),
+            )
             .await
             .map_err(|e| TokenSaveError::Database {
                 message: format!("failed to query all edges: {e}"),
@@ -1477,7 +1557,7 @@ impl Database {
         let mut rows = self
             .conn()
             .query(
-                "SELECT source, target, kind, line FROM edges WHERE kind = ?1",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE kind = ?1",
                 params![kind.as_str()],
             )
             .await
@@ -1500,7 +1580,7 @@ impl Database {
         }
         let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 1)).collect();
         let sql = format!(
-            "SELECT source, target, kind, line FROM edges WHERE kind IN ({})",
+            "SELECT source, target, kind, line, resolved_by FROM edges WHERE kind IN ({})",
             placeholders.join(", ")
         );
         let param_values: Vec<libsql::Value> = kinds
@@ -1617,7 +1697,7 @@ impl Database {
             let placeholders: Vec<String> =
                 (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
             let sql = format!(
-                "SELECT source, target, kind, line FROM edges \
+                "SELECT source, target, kind, line, resolved_by FROM edges \
                  WHERE kind = 'calls' AND target IN ({})",
                 placeholders.join(", ")
             );
@@ -1710,6 +1790,30 @@ impl Database {
                 message: format!("failed to delete edges by source: {e}"),
                 operation: "delete_edges_by_source".to_string(),
             })?;
+        Ok(())
+    }
+
+    /// Deletes the `calls` edges that call sites may have produced, each site
+    /// given as (caller id, line, callee bare name), so a re-resolution of
+    /// every reference at those sites can write them afresh (#597).
+    pub async fn delete_call_edges_at_sites(&self, sites: &[(String, u32, String)]) -> Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        for (source, line, name) in sites {
+            self.conn()
+                .execute(
+                    "DELETE FROM edges
+                     WHERE kind = 'calls' AND source = ?1 AND line = ?2
+                       AND target IN (SELECT id FROM nodes WHERE name = ?3)",
+                    params![source.as_str(), i64::from(*line), name.as_str()],
+                )
+                .await
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to delete call edges at a site: {e}"),
+                    operation: "delete_call_edges_at_sites".to_string(),
+                })?;
+        }
         Ok(())
     }
 }

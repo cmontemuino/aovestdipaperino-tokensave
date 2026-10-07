@@ -1,7 +1,7 @@
 //! Integration tests for the MCP server (`McpServer`) exercising the full
 //! JSON-RPC 2.0 protocol via `ChannelTransport`.
 //!
-//! Run with: `cargo test --features test-transport --test mcp_server_test`
+//! Run with: `cargo test --features test-transport --test integration mcp_server_test::`
 
 #![cfg(feature = "test-transport")]
 
@@ -17,6 +17,8 @@ use tokensave::db::{migrations::latest_version, Database};
 use tokensave::mcp::transport::ChannelTransport;
 use tokensave::mcp::McpServer;
 use tokensave::tokensave::TokenSave;
+
+use crate::common::{json_escaped, qualified_test_name, reported_root};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -36,6 +38,20 @@ async fn setup_server() -> (TempDir, Arc<McpServer>) {
     cg.index_all().await.unwrap();
     let server = McpServer::new(cg, None).await;
     (dir, server)
+}
+
+/// Reopens `cg`'s project with `report_savings = true` written to its config.
+///
+/// Reporting is off by default (#561), so every test that inspects the
+/// `tokensave_metrics:` line turns it on explicitly rather than relying on
+/// the default.
+async fn with_report_savings(cg: TokenSave) -> TokenSave {
+    let project = cg.project_root().to_path_buf();
+    drop(cg);
+    let mut config = tokensave::config::load_config(&project).unwrap();
+    config.report_savings = true;
+    tokensave::config::save_config(&project, &config).unwrap();
+    TokenSave::open(&project).await.unwrap()
 }
 
 async fn setup_named_project(function_name: &str) -> (TempDir, TokenSave) {
@@ -287,6 +303,25 @@ fn response_structured_ids(response: &Value) -> Vec<String> {
             collect_structured_ids(&value, &mut ids);
             ids
         })
+}
+
+/// A status response's text with the `sibling_projects` list removed from its
+/// JSON payload, so path checks see only what describes the answered graph.
+fn status_text_without_siblings(response: &Value) -> String {
+    response["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["text"].as_str())
+        .map(|text| match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(mut payload)) => {
+                payload.remove("sibling_projects");
+                serde_json::to_string_pretty(&payload).unwrap()
+            }
+            _ => text.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn response_payload(response: &Value) -> Value {
@@ -810,12 +845,7 @@ async fn selected_search_is_stateless_and_preserves_local_default() {
     assert!(!selected_text.contains("local_only"), "{selected_text}");
     assert_eq!(
         selected["result"]["_meta"]["tokensave"]["graph_root"],
-        foreign_dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .display()
-            .to_string()
+        reported_root(foreign_dir.path())
     );
     assert_eq!(selected["result"]["_meta"]["tokensave"]["selected"], true);
     assert!(
@@ -1050,6 +1080,148 @@ async fn selected_read_rejects_paths_outside_canonical_selected_root() {
     assert_eq!(read_cache_row_count(&db_path).await, cache_rows_before);
 }
 
+/// #636: the primary project opens its DB read-write, and the containment
+/// check used to run only for read-only (federated) graphs, so a primary-root
+/// `tokensave_read` returned files from anywhere on disk and cached them.
+#[tokio::test]
+async fn primary_read_rejects_paths_outside_project_root() {
+    let (local_dir, local) = setup_named_project("local_only").await;
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("outside-secret.txt");
+    let secret = "OUTSIDE_BYTES_MUST_NOT_BE_RETURNED";
+    fs::write(&outside, secret).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, local_dir.path().join("linked-secret.txt")).unwrap();
+
+    let server = McpServer::new(local, None).await;
+    let db_path = local_dir.path().join(".tokensave/tokensave.db");
+    let cache_rows_before = read_cache_row_count(&db_path).await;
+    // Both temp dirs share a parent, so `..` reaches the secret.
+    let outside_name = outside_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let mut paths = vec![
+        outside.display().to_string(),
+        format!("../{outside_name}/outside-secret.txt"),
+    ];
+    #[cfg(unix)]
+    paths.push("linked-secret.txt".to_string());
+
+    for (index, file) in paths.into_iter().enumerate() {
+        let response = call_server(
+            &server,
+            50 + index as i64,
+            "tokensave_read",
+            json!({ "file": file, "mode": "full" }),
+        )
+        .await;
+
+        // Primary-graph config errors surface as -32603, not the -32602 that
+        // selected graphs use, so assert on the rejection message instead.
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(secret), "{serialized}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("resolves outside selected graph root")),
+            "{response}"
+        );
+    }
+    assert_eq!(read_cache_row_count(&db_path).await, cache_rows_before);
+
+    let inside = call_server(
+        &server,
+        60,
+        "tokensave_read",
+        json!({ "file": "src/main.rs", "mode": "full" }),
+    )
+    .await;
+    assert!(inside["error"].is_null(), "{inside}");
+    assert!(response_text(&inside).contains("local_only"), "{inside}");
+}
+
+async fn setup_nested_project() -> (TempDir, TokenSave) {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src/x")).unwrap();
+    fs::write(
+        project.join("src/x/service.rs"),
+        "pub fn nested_alpha() -> i32 { 1 }\npub fn nested_beta() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+    (dir, cg)
+}
+
+/// Asserts that a `tokensave_read` map/signatures response found the indexed
+/// symbols and echoes the indexer's path form (`src/x/service.rs`).
+fn assert_nested_symbols(response: &Value, label: &str) {
+    assert!(response["error"].is_null(), "{label}: {response}");
+    let text = response_text(response);
+    assert!(
+        text.lines().any(|line| line == "file: src/x/service.rs"),
+        "{label}: echoed path is not the indexed form: {text}"
+    );
+    assert!(
+        text.contains("nested_alpha") && text.contains("nested_beta"),
+        "{label}: indexed symbols missing: {text}"
+    );
+}
+
+/// #644: `tokensave_read` map/signatures look symbols up in the DB by the
+/// displayed relative path. It was derived by stripping the (possibly
+/// non-canonical) root from the canonical path and formatting it with OS
+/// separators, so `./`, `..`, absolute paths through a symlinked temp dir and
+/// (on Windows) every nested path under a graph_root missed the indexer's
+/// forward-slash key and returned `symbol_count: 0`.
+#[tokio::test]
+async fn read_map_and_signatures_use_indexed_path_form() {
+    let (local_dir, local) = setup_nested_project().await;
+    let (selected_dir, selected) = setup_nested_project().await;
+    drop(selected);
+    let server = McpServer::new(local, None).await;
+    let graph_root = selected_dir.path().display().to_string();
+
+    let file_forms = |root: &Path| {
+        vec![
+            "src/x/service.rs".to_string(),
+            "./src/x/service.rs".to_string(),
+            "src/../src/x/service.rs".to_string(),
+            root.join("src/x/service.rs").display().to_string(),
+        ]
+    };
+
+    let mut id = 70;
+    for mode in ["map", "signatures"] {
+        for file in file_forms(selected_dir.path()) {
+            id += 1;
+            let response = call_server(
+                &server,
+                id,
+                "tokensave_read",
+                json!({ "file": file, "mode": mode, "graph_root": graph_root, "force": true }),
+            )
+            .await;
+            assert_nested_symbols(&response, &format!("graph_root {mode} {file}"));
+        }
+        for file in file_forms(local_dir.path()) {
+            id += 1;
+            let response = call_server(
+                &server,
+                id,
+                "tokensave_read",
+                json!({ "file": file, "mode": mode, "force": true }),
+            )
+            .await;
+            assert_nested_symbols(&response, &format!("primary {mode} {file}"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn selected_context_qualifies_ids_without_rewriting_source_literals() {
     let (_local_dir, local) = setup_named_project("local_only").await;
@@ -1135,7 +1307,12 @@ async fn cross_project_selected_queries_leave_both_projects_unchanged() {
             .wait_for_startup_catch_up(std::time::Duration::from_secs(30))
             .await
     );
-    server.cg().checkpoint().await.unwrap();
+    server
+        .cg()
+        .expect("default project")
+        .checkpoint()
+        .await
+        .unwrap();
 
     let local_before = project_snapshot(local_dir.path(), None, "src/main.rs").await;
     let selected_before = project_snapshot(selected_dir.path(), Some("main"), "src/lib.rs").await;
@@ -1217,6 +1394,11 @@ async fn selected_truncated_structured_output_returns_clear_error() {
         json!({
             "query": "huge_item",
             "limit": 500,
+            // Search defaults to text output without node IDs; a truncated
+            // payload with no references to qualify is returned as is, so ask
+            // for the JSON shape with IDs to exercise the refusal.
+            "format": "json",
+            "ids": true,
             "graph_root": foreign_dir.path().display().to_string()
         }),
     )
@@ -1238,9 +1420,14 @@ async fn selectors_are_rejected_for_non_graph_scoped_tools_before_dispatch() {
     let graph_root = foreign_dir.path().display().to_string();
 
     let calls = [
+        // A read-only local-graph tool. `tokensave_status` used to stand in
+        // here, but it accepts selectors since #500.
         (
-            "tokensave_status",
-            json!({ "graph_root": graph_root.clone() }),
+            "tokensave_affected",
+            json!({
+                "files": ["src/main.rs"],
+                "graph_root": graph_root.clone()
+            }),
         ),
         (
             "tokensave_str_replace",
@@ -1276,7 +1463,10 @@ async fn selectors_are_rejected_for_non_graph_scoped_tools_before_dispatch() {
     assert!(!source.contains("after_edit"), "{source}");
     let stats = server.server_stats_json().await;
     assert_eq!(stats["tool_calls"], 3, "{stats}");
-    assert_eq!(stats["tool_call_counts"]["tokensave_status"], 1, "{stats}");
+    assert_eq!(
+        stats["tool_call_counts"]["tokensave_affected"], 1,
+        "{stats}"
+    );
     assert_eq!(
         stats["tool_call_counts"]["tokensave_str_replace"], 1,
         "{stats}"
@@ -1749,7 +1939,7 @@ async fn selected_warnings_use_canonical_selected_root_remedies() {
     foreign.checkpoint().await.unwrap();
     drop(foreign);
     let server = McpServer::new(local, None).await;
-    let canonical_root = foreign_dir.path().canonicalize().unwrap();
+    let canonical_root = reported_root(foreign_dir.path());
 
     let response = call_server(
         &server,
@@ -1764,7 +1954,9 @@ async fn selected_warnings_use_canonical_selected_root_remedies() {
 
     assert!(response["error"].is_null(), "{response}");
     let text = response_text(&response);
-    let quoted_root = format!("\"{}\"", canonical_root.display());
+    // Warnings quote the root as a JSON string, which doubles a Windows
+    // path's backslashes.
+    let quoted_root = serde_json::to_string(&canonical_root).unwrap();
     assert!(text.contains(&quoted_root), "{text}");
     assert!(
         text.contains("Run Tokensave synchronization from selected project root"),
@@ -1887,7 +2079,10 @@ async fn selected_calls_skip_all_accounting_and_preserve_local_schema_charge() {
         command
             .args([
                 "--exact",
-                "selected_calls_skip_all_accounting_and_preserve_local_schema_charge",
+                &qualified_test_name(
+                    module_path!(),
+                    "selected_calls_skip_all_accounting_and_preserve_local_schema_charge",
+                ),
                 "--nocapture",
             ])
             .env("TOKENSAVE_SELECTED_ACCOUNTING_HOME", home.path())
@@ -1908,7 +2103,7 @@ async fn selected_calls_skip_all_accounting_and_preserve_local_schema_charge() {
     let (local_dir, local) = setup_named_project("local_only").await;
     let (foreign_dir, foreign) = setup_named_project("foreign_only").await;
     drop(foreign);
-    let server = McpServer::new(local, None).await;
+    let server = McpServer::new(with_report_savings(local).await, None).await;
     assert!(
         server
             .wait_for_startup_catch_up(std::time::Duration::from_secs(30))
@@ -1924,7 +2119,12 @@ async fn selected_calls_skip_all_accounting_and_preserve_local_schema_charge() {
     let global = tokensave::global_db::GlobalDb::open().await.unwrap();
     let local_path = local_dir.path().to_string_lossy();
     let foreign_path = foreign_dir.path().to_string_lossy();
-    let local_tokens_before = server.cg().get_tokens_saved().await.unwrap();
+    let local_tokens_before = server
+        .cg()
+        .expect("default project")
+        .get_tokens_saved()
+        .await
+        .unwrap();
     let total_ledger_before = global.sum_savings(None, 0).await.calls;
     let local_ledger_before = global.sum_savings(Some(&local_path), 0).await.calls;
     let foreign_ledger_before = global.sum_savings(Some(&foreign_path), 0).await.calls;
@@ -1960,7 +2160,12 @@ async fn selected_calls_skip_all_accounting_and_preserve_local_schema_charge() {
         "selected call must not leave accounting work pending"
     );
     assert_eq!(
-        server.cg().get_tokens_saved().await.unwrap(),
+        server
+            .cg()
+            .expect("default project")
+            .get_tokens_saved()
+            .await
+            .unwrap(),
         local_tokens_before
     );
     assert_eq!(global.sum_savings(None, 0).await.calls, total_ledger_before);
@@ -2193,7 +2398,7 @@ async fn test_search_metrics_are_capped_and_net() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let responses = run_server_with_messages(
         server,
@@ -2287,7 +2492,7 @@ async fn test_schema_overhead_survives_a_failed_first_call() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let search_call = || {
         jsonrpc_request(
@@ -2416,7 +2621,7 @@ async fn test_uncached_full_read_baseline_matches_file_weight() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let file_tokens = (padded_source.len() / 4) as u64;
 
@@ -2446,11 +2651,11 @@ async fn test_uncached_full_read_baseline_matches_file_weight() {
     );
 }
 
-/// A cache-hit re-read of the same file returns a small `{"unchanged": ...}`
-/// stub, not the file content — its baseline must be capped near that stub,
-/// not the full file. Before the fix, `tokensave_read` was unconditionally
-/// classified `FullFile`, so a cached read of a large file claimed the
-/// entire file as "saved" for a response that carried none of it.
+/// A re-read that echoes back a matching `if_digest` returns a small
+/// `{"unchanged": ...}` stub, not the file content — its baseline must be
+/// capped near that stub, not the full file. Before the fix, `tokensave_read`
+/// was unconditionally classified `FullFile`, so a stub read of a large file
+/// claimed the entire file as "saved" for a response that carried none of it.
 #[tokio::test]
 async fn test_cached_read_baseline_is_capped_not_full_file() {
     let dir = TempDir::new().unwrap();
@@ -2463,21 +2668,46 @@ async fn test_cached_read_baseline_is_capped_not_full_file() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let digest = {
+        let first = tokensave::mcp::handle_tool_call(
+            &cg,
+            "tokensave_read",
+            json!({ "file": "src/main.rs", "mode": "full" }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Text format: the file exceeds the response cap, and a truncated
+        // JSON payload would not parse, but the header always survives.
+        first.value["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("digest: "))
+            .unwrap()
+            .to_string()
+    };
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let file_tokens = (padded_source.len() / 4) as u64;
-    let read_call = |id: i64| {
-        jsonrpc_request(
-            json!(id),
+    let responses = run_server_with_messages(
+        server,
+        vec![jsonrpc_request(
+            json!(82),
             "tools/call",
             json!({
                 "name": "tokensave_read",
-                "arguments": { "file": "src/main.rs", "mode": "full", "format": "json" }
+                "arguments": {
+                    "file": "src/main.rs",
+                    "mode": "full",
+                    "format": "json",
+                    "if_digest": digest
+                }
             }),
-        )
-    };
-
-    let responses = run_server_with_messages(server, vec![read_call(81), read_call(82)]).await;
+        )],
+    )
+    .await;
 
     let second_resp = responses
         .iter()
@@ -2492,22 +2722,22 @@ async fn test_cached_read_baseline_is_capped_not_full_file() {
     };
     assert!(
         text.contains("\"unchanged\""),
-        "second identical read should be served from the read cache as an \
-         unchanged stub, got: {text}"
+        "a read with a matching if_digest should be an unchanged stub, got: {text}"
     );
 
     let before = extract_metrics_field(second_resp, "before");
     assert!(
         before < file_tokens / 4,
-        "a cache-hit stub must not claim the full file's weight as its \
+        "a stub must not claim the full file's weight as its \
          baseline: before={before} file_tokens={file_tokens}"
     );
 }
 
-/// `force: true` bypasses the cross-session cache, so a caller that has not
-/// received this file's body in this session can always ask for it (#556).
+/// Repeated reads through the server always return the body: the server no
+/// longer decides on its own that the client still holds it (#650). The
+/// deprecated `force` flag is still accepted (#556).
 #[tokio::test]
-async fn test_read_force_bypasses_cache() {
+async fn test_repeated_read_returns_body_and_force_still_accepted() {
     let dir = TempDir::new().unwrap();
     let project = dir.path();
     fs::create_dir_all(project.join("src")).unwrap();
@@ -2532,31 +2762,37 @@ async fn test_read_force_bypasses_cache() {
         )
     };
 
-    // First call populates the cache; the second identical call with
-    // `force: true` must still return the body, not an unchanged stub.
-    let responses =
-        run_server_with_messages(server, vec![read_call(91, false), read_call(92, true)]).await;
+    let responses = run_server_with_messages(
+        server,
+        vec![
+            read_call(91, false),
+            read_call(92, false),
+            read_call(93, true),
+        ],
+    )
+    .await;
 
-    let second_resp = responses
-        .iter()
-        .find(|r| parse_response(r)["id"] == 92)
-        .expect("should have a response for id=92");
-    let text = {
-        let resp = parse_response(second_resp);
-        resp["result"]["content"].as_array().unwrap()[0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert!(
-        text.contains("fn helper"),
-        "forced read must return the body even when the cache holds an \
-         unchanged stub, got: {text}"
-    );
-    assert!(
-        !text.contains("\"unchanged\""),
-        "forced read must not return an unchanged stub, got: {text}"
-    );
+    for id in [91, 92, 93] {
+        let resp = responses
+            .iter()
+            .find(|r| parse_response(r)["id"] == id)
+            .unwrap_or_else(|| panic!("should have a response for id={id}"));
+        let text = {
+            let resp = parse_response(resp);
+            resp["result"]["content"].as_array().unwrap()[0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            text.contains("fn helper"),
+            "read {id} must return the body, got: {text}"
+        );
+        assert!(
+            !text.contains("unchanged"),
+            "read {id} must not return an unchanged stub, got: {text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2579,7 +2815,7 @@ async fn test_schema_overhead_not_charged_without_tools_list() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let responses = run_server_with_messages(
         server,
@@ -2627,7 +2863,7 @@ async fn test_schema_overhead_charged_after_tools_list_call() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let responses = run_server_with_messages(
         server,
@@ -2669,7 +2905,18 @@ async fn test_schema_overhead_charged_after_tools_list_call() {
 /// honest when it matches exactly what the response contains.
 #[tokio::test]
 async fn test_zero_before_call_never_gets_a_metrics_line() {
-    let (_dir, server) = setup_server().await;
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/main.rs"),
+        "fn main() { let x = helper(); }\nfn helper() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+    // Reporting on, so the absent line is down to `before == 0` alone.
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let responses = run_server_with_messages(
         server,
@@ -2726,7 +2973,7 @@ async fn test_schema_debt_is_paid_down_not_discarded() {
     fs::write(project.join("src/main.rs"), &padded_source).unwrap();
     let cg = TokenSave::init(project).await.unwrap();
     cg.index_all().await.unwrap();
-    let server = McpServer::new(cg, None).await;
+    let server = McpServer::new(with_report_savings(cg).await, None).await;
 
     let status_call = |id: i64| {
         jsonrpc_request(
@@ -3799,21 +4046,23 @@ async fn selected_status_reports_the_selected_graph() {
     .await;
     assert!(selected["error"].is_null(), "{selected}");
 
-    let text = response_text(&selected);
-    let foreign_root = foreign_dir.path().canonicalize().unwrap();
+    // Sibling projects are listed by path, and in a shared temp directory the
+    // local project is often one of them, so they are left out of the check.
+    let text = status_text_without_siblings(&selected);
+    let foreign_root = json_escaped(&reported_root(foreign_dir.path()));
+    // The local project reports its root as it was opened, which on macOS is
+    // the `/var` spelling rather than the canonical `/private/var` one, so
+    // check both.
+    let local_roots = [
+        json_escaped(&reported_root(local_dir.path())),
+        json_escaped(&local_dir.path().to_string_lossy()),
+    ];
     assert!(
-        text.contains(&foreign_root.display().to_string()),
+        text.contains(&foreign_root),
         "status should describe the selected project: {text}"
     );
     assert!(
-        !text.contains(
-            &local_dir
-                .path()
-                .canonicalize()
-                .unwrap()
-                .display()
-                .to_string()
-        ),
+        !local_roots.iter().any(|root| text.contains(root.as_str())),
         "status must not describe the local project: {text}"
     );
     assert_eq!(selected["result"]["_meta"]["tokensave"]["selected"], true);
@@ -3821,9 +4070,15 @@ async fn selected_status_reports_the_selected_graph() {
     // The local call still answers for the server's own project.
     let local_status = call_server(&server, 72, "tokensave_status", json!({})).await;
     assert!(local_status["error"].is_null(), "{local_status}");
-    let local_text = response_text(&local_status);
+    let local_text = status_text_without_siblings(&local_status);
     assert!(
-        !local_text.contains(&foreign_root.display().to_string()),
+        local_roots
+            .iter()
+            .any(|root| local_text.contains(root.as_str())),
+        "an unselected status must answer for the local project: {local_text}"
+    );
+    assert!(
+        !local_text.contains(&foreign_root),
         "an unselected status must still answer for the local project: {local_text}"
     );
     let _ = local_dir;

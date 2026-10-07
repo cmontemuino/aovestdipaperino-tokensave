@@ -258,6 +258,13 @@ tokensave install --agent pi          # Pi (pi.dev)
 tokensave install --agent plank       # Plank (macOS only)
 ```
 
+Repeat `--agent` to install several agents in one run — the permission grant
+and the git-hook prompt only fire once per command:
+
+```bash
+tokensave install --agent claude --agent cursor --agent droid
+```
+
 You can also pre-decide the global git `post-commit` hook prompt — useful in
 bash scripts and onboarding playbooks where a `read_line` would otherwise block:
 
@@ -359,6 +366,10 @@ tokensave serve
 ```
 
 This starts the MCP server over stdio. You normally don't need to run this yourself — the agent integration handles it. But it's useful for debugging or connecting custom tools.
+
+#### Starting outside a project
+
+If `serve` starts in a folder that is not inside an indexed project (a scratch folder, a session with no project, or `-p` pointing at a folder with no index), it no longer exits. It starts with **no default project**: `initialize` succeeds and lists the registered projects, and every tool call passes `graph_root` with one of them. `tokensave_status` without `graph_root` answers with that list. Any other call without `graph_root` gets an error that names the registered projects. An explicit `-p` without an index never falls back to another project; without `-p`, the only registered project is still served as before.
 
 ### Working from a subdirectory
 
@@ -833,9 +844,9 @@ When running as an MCP server, tokensave exposes more than 80 tools that AI agen
 
 ### Listing fewer tools
 
-A client sends the schema of every listed tool on every turn, before any tool is called, so the full list costs context whether or not the tools are used. `"tools": "core"` in `.tokensave/config.json`, or `TOKENSAVE_TOOLS=core`, lists 11 tools instead: `context`, `search`, `status`, `read`, `body`, `files`, `callers`, `callees`, `impact`, `str_replace` and `multi_str_replace`. With the core list, `tokensave_more` lists the tools of one area (`analysis`, `edit`, `git`, `memory`, `navigate`, or `all`) for the rest of the session. The server announces the change, so the client fetches the list again.
+A client sends the schema of every listed tool on every turn, before any tool is called, so the full list costs context whether or not the tools are used. By default the server lists 11 core tools: `context`, `search`, `status`, `read`, `body`, `files`, `callers`, `callees`, `impact`, `str_replace` and `multi_str_replace`, plus `tokensave_more`, which lists the tools of one area (`analysis`, `edit`, `git`, `memory`, `navigate`, or `all`) for the rest of the session. The server announces the change, so the client fetches the list again. The `initialize` instructions name the core tools and the areas, so an agent that has not seen a tool's schema still knows how to reach it.
 
-The setting chooses what is listed, not what runs: a tool that is not listed still answers a call, so permission lists and hooks keep working. The default is `"full"`.
+The setting chooses what is listed, not what runs: a tool that is not listed still answers a call, so permission lists and hooks keep working. To list every tool, set `"tools": "full"` in `.tokensave/config.json` or `TOKENSAVE_TOOLS=full` (the environment variable wins). A `"tools": "full"` written by 7.13.0, which wrote that value into every config it saved, is read as the old default; set it again after upgrading to keep the full list.
 
 ### Core exploration
 
@@ -901,7 +912,20 @@ only files you asked about and the index could not answer for.
 | `tokensave_impact` | Trace the full blast radius of changing a symbol — everything that could be affected. |
 | `tokensave_affected` | Find test files affected by source file changes. |
 | `tokensave_similar` | Find symbols with similar names (useful for naming patterns or related code). |
-| `tokensave_rename_preview` | Preview all references to a symbol before renaming it. |
+| `tokensave_rename` | Rename a symbol at its definition and at every reference the graph records. Dry run by default: lists the sites by file with a confidence class and shows a unified diff. Graph-based, not binding-aware — see [Renaming a symbol](#renaming-a-symbol). The old `tokensave_rename_preview` name still works as a dry-run alias. |
+
+#### Renaming a symbol
+
+`tokensave_rename` renames a symbol at its definition and at every reference the code graph records. It is graph-based, **not binding-aware**: references come from tokensave's name-based resolver, not from each language's scope rules, so a shadowing local, a dynamic call or a `**kwargs` splat can be missed or attributed to the wrong symbol. Each site carries a confidence class, taken from how the resolver bound it (`resolved_by`, stored on every edge since schema v18):
+
+| Class | Meaning | Edited? |
+|-------|---------|---------|
+| `exact` | Bound by a qualified path, a typed receiver, an import, or a name no other symbol carries, and located to one token | Yes |
+| `heuristic` | Bound by a name-based fallback (the tail of `recv.method`, scoring among same-named candidates, a blocklisted common name, a build variant), an override paired by name, or a token that could not be told apart from another on the same line | Only with `allow_heuristic: true` |
+| `ambiguous` | A call the resolver could not decide between this symbol and others | Never |
+| `text_only` | A whole-word mention the graph does not link: a comment, string, doc, or an unlinked identifier in code | Never |
+
+A dry run (the default) returns the plan and a unified diff. Applying refuses while any site is `heuristic` or `ambiguous`, or an unlinked identifier mentions the name, unless `allow_heuristic` is set. The apply is all-or-nothing: every edited file must still parse with tree-sitter without new error nodes, keywords and non-identifiers are refused, and so is a name already used in the same scope. Mentions past the listing cap are counted but not listed, and they still gate an apply, as does a file that mentions the name but is too large or unreadable to check. Lines and columns are 1-based; a column counts bytes, not characters. Only indexed files are scanned, so a file the indexer skips (over `max_file_size`, 1 MB by default, or excluded) is not checked for mentions. Writes follow symlinks, including links that point outside the project: the target file is edited and the link is kept. The edited files are reindexed together and their references re-resolved, so the renamed symbol keeps its callers.
 
 ### Code quality analysis
 
@@ -1095,7 +1119,7 @@ Rust, Go, Java, Scala, TypeScript, JavaScript, Python, C, C++, Kotlin, C#, Swift
 
 Adds scripting, config, and additional systems languages.
 
-Dart, Pascal, PHP, Ruby, Bash, Protobuf, PowerShell, Nix, VB.NET
+Dart, Pascal, PHP, Ruby (including `.rake` task files), Bash, Protobuf, PowerShell, Nix, VB.NET
 
 ### Full (Medium + everything else, the default)
 
@@ -1204,7 +1228,7 @@ scoop update tokensave          # Scoop
 cargo install tokensave         # Cargo
 ```
 
-Upgrades are zero-touch: you normally do **not** need to re-run `install` or `sync --force` by hand. Tokensave compares the version that last ran against the running one and performs exactly the maintenance that transition requires — refreshing every registered agent's config on a minor or major bump, and rebuilding project indexes on a major one. That refresh is silent; it will not print install output in front of your next `init` or `sync`. See [TOKENSAVE-VERSIONING.md](../TOKENSAVE-VERSIONING.md) for the full rules.
+Upgrades are zero-touch: you normally do **not** need to re-run `install` or `sync --force` by hand. Tokensave compares the version that last ran against the running one and performs exactly the maintenance that transition requires — refreshing every registered agent's config on a minor or major bump, and rebuilding project indexes on a major one. That refresh is silent; it will not print install output in front of your next `init` or `sync`. It also rewrites tokensave's own section of any git hooks already installed (the global ones, and the current repository's), so hook fixes reach you too; it never installs a hook you didn't have. `tokensave reinstall` does the same on demand, and `doctor` reports a hook whose tokensave section is out of date. See [TOKENSAVE-VERSIONING.md](../TOKENSAVE-VERSIONING.md) for the full rules.
 
 The two cases where you should still step in:
 

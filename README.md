@@ -163,6 +163,14 @@ Global OMP installs target the profile reported by bare `omp config path`, writi
 
 All changes are idempotent -- safe to run again after upgrading. After agent setup, you'll be offered global git post-commit and post-checkout hooks. `tokensave uninstall` removes those hooks along with the agent integrations; pass `--keep-git-hooks` to leave them, or manage them on their own with `tokensave githooks`.
 
+### Install for several agents at once
+
+Repeat `--agent` to install several agents in a single run. The permission grant, git-hook offer, and global config write each happen once, no matter how many agents you list:
+
+```bash
+tokensave install --agent claude --agent cursor --agent droid
+```
+
 ### Project-local install
 
 By default `tokensave install` registers the MCP server in your **global** agent config (e.g. `~/.claude.json`). To register tokensave for just the current project instead, add `--local`:
@@ -420,7 +428,7 @@ Different from the criterion bench above: criterion measures per-iteration laten
 
 ## 80+ MCP Tools
 
-The server exposes more than 80 tools (one fewer when the optional `ast-grep` binary is not on `PATH`); the tables below group the most commonly used ones by category. Most are read-only, safe to call in parallel, and annotated with `readOnlyHint`. The edit primitives are scoped to single files and re-index in place; session baseline and memory-recording tools also mutate local `.tokensave` state and are annotated as non-read-only. The three core tools (`tokensave_context`, `tokensave_search`, `tokensave_status`) are marked `anthropic/alwaysLoad` so they bypass the client's tool-search round-trip.
+The server exposes more than 80 tools (one fewer when the optional `ast-grep` binary is not on `PATH`). Since 7.14.0 only the 11 core tools plus `tokensave_more` are listed by default; the rest are listed on demand through `tokensave_more`, stay callable by name, and are all listed with `"tools": "full"`. The tables below group the most commonly used ones by category. Most are read-only, safe to call in parallel, and annotated with `readOnlyHint`. The edit primitives are scoped to single files and re-index in place; session baseline and memory-recording tools also mutate local `.tokensave` state and are annotated as non-read-only. The three core tools (`tokensave_context`, `tokensave_search`, `tokensave_status`) are marked `anthropic/alwaysLoad` so they bypass the client's tool-search round-trip.
 
 ### Query another initialized project
 
@@ -513,7 +521,7 @@ partial answer is never presented as a complete one.
 | `tokensave_callees` | Find what a function calls |
 | `tokensave_impact` | See what's affected by changing a symbol |
 | `tokensave_affected` | Find test files affected by source changes |
-| `tokensave_rename_preview` | All references to a symbol (preview rename impact) |
+| `tokensave_rename` | Graph-based rename: every site with a confidence class (`exact`, `heuristic`, `ambiguous`, `text_only`), a diff preview, and an all-or-nothing apply. Not binding-aware |
 | `tokensave_hotspots` | Most connected symbols (highest call count) |
 
 ### Code Quality
@@ -617,9 +625,9 @@ tokensave measures the tokens it saves on every MCP tool call. Each tool respons
 
 **Turning the reporting off.** The metrics line, together with a sentence in the MCP `instructions`, asks the agent to report savings to you — which means the model spends *output* tokens narrating a saving tokensave made on *input* tokens. Output tokens are the more expensive kind, so if your agent mentions tokensave on nearly every turn, that narration can offset the win (#356). Set `report_savings` to `false` in `.tokensave/config.json`, or the `TOKENSAVE_REPORT_SAVINGS` environment variable to override it per-run (any value enables it except `0`, `false`, `no`, `off`, or empty). Both the metrics line and the instruction disappear; `tokensave install` likewise stops writing the reporting rule into agent prompt files. Measurement is untouched either way — every call still lands in the savings ledger, so `tokensave gain`, `tokensave list`, `status` and `monitor` keep reporting exactly as before. The default stays `true`.
 
-**Listing fewer tools.** An MCP client sends the schema of every listed tool on every turn, before any tool is called. The full tokensave surface is about 100 KB of schema, which on a small-context model can be more than half of the window (#576). Set `"tools": "core"` in `.tokensave/config.json`, or `TOKENSAVE_TOOLS=core` in the environment of the MCP server, and `tools/list` sends only the core tools: `context`, `search`, `status`, `read`, `body`, `files`, `callers`, `callees`, `impact`, `str_replace` and `multi_str_replace` (about 19 KB with `tokensave_more`). The setting selects what the server lists, not what it can run: a tool that is not listed still answers a call by name, so agent permission lists and hooks keep working. The default is `"full"`.
+**Only the core tools are listed by default.** An MCP client sends the schema of every listed tool on every turn, before any tool is called. The full tokensave surface is about 89 KB of schema, which on a small-context model can be more than half of the window (#576). So `tools/list` sends only the core tools: `context`, `search`, `status`, `read`, `body`, `files`, `callers`, `callees`, `impact`, `str_replace` and `multi_str_replace` (about 17 KB with `tokensave_more`). The `initialize` instructions name these tools and the areas `tokensave_more` can list, so a client that defers tool schemas still knows the rest exist. The setting selects what the server lists, not what it can run: a tool that is not listed still answers a call by name, so agent permission lists and hooks keep working. To list every tool, set `"tools": "full"` in `.tokensave/config.json`, or `TOKENSAVE_TOOLS=full` in the environment of the MCP server; the environment variable wins over the file. A `"tools": "full"` written by 7.13.0, which wrote it into every config it saved, is read as the old default; set it again after upgrading to keep the full list.
 
-With the core toolset the server also lists `tokensave_more`. A call with an `area` (`analysis`, `edit`, `git`, `memory`, `navigate` or `all`) lists the tools of that area for the rest of the session, and the server sends `notifications/tools/list_changed` so the client fetches the list again. A session pays only for the areas it uses: the `git` area adds about 6 KB. A client that ignores `list_changed` keeps the core list. The first `tokensave_more` call can ask for permission, because agent permission lists do not name it.
+With the core toolset the server also lists `tokensave_more`. A call with an `area` (`analysis`, `edit`, `git`, `memory`, `navigate` or `all`) lists the tools of that area for the rest of the session, and the server sends `notifications/tools/list_changed` so the client fetches the list again. A session pays only for the areas it uses: the `git` area adds about 6 KB. A client that ignores `list_changed` keeps the core list. `tokensave install` grants `tokensave_more` along with every other tool, so it does not prompt; an install from before this release prompts once, until `tokensave reinstall` or the upgrade resync refreshes the permission list.
 
 ### Cost observability
 
@@ -871,12 +879,16 @@ Always compiled. The smallest binary for the most popular languages, plus Svelte
 | Dart | `.dart` | `lang-dart` |
 | Pascal | `.pas`, `.pp`, `.dpr` | `lang-pascal` |
 | PHP | `.php` | `lang-php` |
-| Ruby | `.rb` | `lang-ruby` |
+| Ruby (including ERB and Slim templates) | `.rb`, `.rake`, `.erb`, `.slim` | `lang-ruby` |
 | Bash | `.sh`, `.bash` | `lang-bash` |
 | Protobuf | `.proto` | `lang-protobuf` |
 | PowerShell | `.ps1`, `.psm1` | `lang-powershell` |
 | Nix | `.nix` | `lang-nix` |
 | VB.NET | `.vb` | `lang-vbnet` |
+
+ERB and Slim templates use the Ruby grammar without requiring Ruby or template gems at indexing time. Template calls belong to the file node and retain their original line and byte column. ERB supports code/output tags, trim markers, comments, and escaped tags. Slim supports control/output lines, indentation-based blocks, attributes (including multiline attribute lists), text interpolation, and `ruby:` blocks.
+
+Custom Slim shortcuts and embedded-language compilation are not supported. Locals supplied by Rails at render time cannot be distinguished from bare helper calls; names assigned or bound in the template are excluded conservatively. Controller-to-view and partial-render relationships require separate Rails semantic wiring.
 
 ### Full (Medium + everything else) -- default
 

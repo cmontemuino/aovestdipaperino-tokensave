@@ -439,6 +439,12 @@ async fn test_callers_nonexistent_node_id_errors() {
         msg.contains("node not found"),
         "expected a node-not-found error, got: {msg}"
     );
+    // #576: tokensave_callers_for is not a core tool, so the error says how
+    // to list it.
+    assert!(
+        msg.contains("tokensave_callers_for (via tokensave_more area \"navigate\""),
+        "{msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -866,12 +872,21 @@ async fn test_rename_preview() {
     )
     .await
     .unwrap();
+    // A hidden alias of `tokensave_rename` with dry_run forced on (#568).
     let text = extract_text(&result.value);
-    assert!(
-        text.contains("reference_count"),
-        "should have reference_count key"
-    );
-    assert!(text.contains("node"), "should have node key");
+    let plan: Value = serde_json::from_str(text).expect("rename plan is JSON");
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["symbol"]["name"], "helper");
+    assert!(plan["counts"]["exact"].as_u64().unwrap() >= 1, "{plan:#}");
+    // The definition and the call from main.rs are both rename sites.
+    let files: Vec<&str> = plan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"src/utils.rs"), "{plan:#}");
+    assert!(files.contains(&"src/main.rs"), "{plan:#}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,7 +1406,7 @@ async fn test_search_populates_touched_files() {
 }
 
 // ---------------------------------------------------------------------------
-// Extra: rename_preview with nonexistent node
+// Extra: rename_preview (alias of tokensave_rename) with nonexistent node
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -5991,8 +6006,17 @@ async fn mcp_server_owns_watcher_and_refreshes_token_map_on_change() {
     // growing is the observable outcome regardless of which sync won.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let after_count = loop {
-        let stale = server.cg().find_stale_files().await;
-        server.cg().sync_if_stale_silent(&stale).await.unwrap();
+        let stale = server
+            .cg()
+            .expect("default project")
+            .find_stale_files()
+            .await;
+        server
+            .cg()
+            .expect("default project")
+            .sync_if_stale_silent(&stale)
+            .await
+            .unwrap();
         server.refresh_file_token_map().await;
         let count = server.file_token_map_snapshot().len();
         if count > initial_count || std::time::Instant::now() >= deadline {
@@ -6213,6 +6237,7 @@ pub fn residual_vector<T: LinearOperator>(operator: &T, x: &[f64], ax: &mut [f64
             target: sources[0].id.clone(),
             kind: tokensave::types::EdgeKind::Calls,
             line: Some(14),
+            resolved_by: None,
         }])
         .await
         .unwrap();
@@ -6361,36 +6386,42 @@ async fn affected_classifies_candidates_and_includes_inline_sources_in_suite() {
                 target: changed.clone(),
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: direct,
                 target: changed.clone(),
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: facade.clone(),
                 target: changed.clone(),
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: integration,
                 target: facade,
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(3),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: bridge.clone(),
                 target: changed,
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: consumer,
                 target: bridge,
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
         ])
         .await
@@ -6980,7 +7011,12 @@ async fn entities_marks_files_that_have_companion_docs() {
     let parsed: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
     assert_eq!(parsed["has_doc"], true, "{parsed:?}");
     assert_eq!(parsed["doc_path"], json!(["src/big_class.readme.md"]));
-    assert!(parsed["doc_hint"].is_string(), "{parsed:?}");
+    // #576: tokensave_doc is not a core tool, so the hint says how to list it.
+    let hint = parsed["doc_hint"].as_str().expect("doc_hint");
+    assert!(
+        hint.contains("tokensave_doc") && hint.contains("tokensave_more area \"navigate\""),
+        "{hint}"
+    );
 }
 
 #[tokio::test]

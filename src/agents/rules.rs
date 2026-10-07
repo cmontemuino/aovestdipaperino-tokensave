@@ -97,11 +97,19 @@ const CANONICAL_RULES_MARKDOWN: &str = "## Prefer tokensave MCP tools\n\n\
 Before reading source files or scanning a codebase, use the tokensave MCP tools: \
 `tokensave_context` for exploration, `tokensave_search` for a known symbol, plus \
 `tokensave_callers`, `tokensave_callees`, `tokensave_impact`, `tokensave_node`, \
-`tokensave_files`, and `tokensave_affected`.\n\n\
+`tokensave_files`, and `tokensave_affected`. A tool that is not in your tool \
+list is listed by calling `tokensave_more` with its area: `navigate` for \
+`tokensave_node`, `git` for `tokensave_affected` and the branch tools.\n\n\
 To read a file's contents, use `tokensave_read`: it reads any path, indexed or \
 not, and slices with `mode: \"lines\"` or maps a file's symbols with \
 `mode: \"map\"` instead of pulling in the whole body. Use the harness's own \
 file-read tool for a file you are about to edit.\n\n\
+### Searching code\n\n\
+Search code with `tokensave_search`. By default it returns where a name is \
+defined, ranked, with its kind and signature. With `literal: true` it finds \
+exact text: `.Name(` for calls through an object, `Name(` for every call, \
+`: IName` for implementers. Grep when you need a regex, or a file type the \
+index skips.\n\n\
 ### Check freshness before relying on the graph\n\n\
 Call the `tokensave_status` MCP tool (not the `tokensave status` CLI, which \
 indexes a folder that has no index) to see when the index was last synced. Run \
@@ -152,8 +160,10 @@ prompt:\n\n\
 ### When the hook denies a search\n\n\
 A denied grep, glob, or find means the search looked like a code-symbol lookup \
 and a tokensave tool answers it better. It is not an obstacle to route around. \
-Use `tokensave_search` for a symbol by name, `tokensave_callers` or \
-`tokensave_impact` for its uses, `tokensave_context` for a concept, and \
+Use `tokensave_search` for a symbol by name, `tokensave_search` with \
+`literal: true` (e.g. `{\"query\": \".Name(\", \"literal\": true}`) or \
+`tokensave_callers` for its uses, `tokensave_impact` for what depends on it, \
+`tokensave_context` for a concept, and \
 `tokensave_files` for files by path. A search that is not about code (logs, \
 docs, config) passes when it names the file type, e.g. `--include='*.md'` or a \
 `*.md` glob. Set `TOKENSAVE_DISABLE_GREP_HOOK=1` only for a search that is \
@@ -495,26 +505,44 @@ pub fn write_rules_block(path: &Path, agent_id: &str, body: &str) -> Result<bool
         String::new()
     };
 
-    // Already current?
-    if let Some((installed_body, _, _)) = find_rules_block(&contents) {
+    let new_contents = if let Some((installed_body, start, end)) = find_rules_block(&contents) {
+        // Already current?
         if installed_body.trim_end() == body.trim_end() {
             return Ok(false);
         }
-    }
-
-    // Migrate away any managed-block or heading-guarded block before appending
-    // the new marker-delimited block. Remove the managed block first so the
-    // legacy heading marker inside it does not trigger a false match.
-    let contents = remove_legacy_rules_block_from_contents(
-        &remove_rules_block_from_contents(&contents),
-        LEGACY_RULES_MARKER,
-        &[],
-    );
-
-    let new_contents = if contents.trim().is_empty() {
-        new_block
+        // Refresh in place (issue #621): the new block takes the old one's
+        // position and the owner's text on either side is kept byte-for-byte.
+        // Only later duplicate blocks and stale legacy heading blocks outside
+        // the markers are migrated away.
+        let mut prefix = contents[..start].to_string();
+        if prefix.contains(LEGACY_RULES_MARKER) {
+            // Migration trims whitespace; restore a blank line before the block.
+            prefix = remove_legacy_rules_block_from_contents(&prefix, LEGACY_RULES_MARKER, &[]);
+            if !prefix.is_empty() {
+                prefix = format!("{}\n\n", prefix.trim_end());
+            }
+        }
+        let mut suffix = remove_rules_block_from_contents(&contents[end..]);
+        if suffix != contents[end..] && !suffix.is_empty() && !suffix.ends_with('\n') {
+            // Collapsing a trailing duplicate block trims the final newline.
+            suffix.push('\n');
+        }
+        if suffix.contains(LEGACY_RULES_MARKER) {
+            // Migration trims whitespace; restore a blank line after the block.
+            suffix = remove_legacy_rules_block_from_contents(&suffix, LEGACY_RULES_MARKER, &[]);
+            if !suffix.is_empty() {
+                suffix = format!("\n{}\n", suffix.trim_end());
+            }
+        }
+        format!("{prefix}{new_block}{suffix}")
     } else {
-        format!("{}\n\n{new_block}", contents.trim_end())
+        // Fresh install: migrate any legacy heading-guarded block, then append.
+        let contents = remove_legacy_rules_block_from_contents(&contents, LEGACY_RULES_MARKER, &[]);
+        if contents.trim().is_empty() {
+            new_block
+        } else {
+            format!("{}\n\n{new_block}", contents.trim_end())
+        }
     };
 
     backup_config_file(path)?;
@@ -844,6 +872,48 @@ mod tests {
         assert!(body.contains("graph_root"));
         assert!(body.contains("branch-meta.json"));
         assert!(body.contains("filesystem"));
+    }
+
+    /// #653: the rules say what `literal: true` finds and when grep is the
+    /// right tool, so agents stop falling back to grep for call sites.
+    #[test]
+    fn canonical_rules_cover_literal_search_and_when_to_grep() {
+        let body = canonical_rules_markdown();
+        assert!(body.contains("### Searching code"));
+        assert!(body.contains("`literal: true`"));
+        assert!(body.contains("`.Name(`"));
+        assert!(body.contains("Grep when you need a regex"));
+    }
+
+    /// The core toolset is the default (#576), so a tool the rules name that
+    /// is not core is not in the agent's tool list. The rules must say how to
+    /// list it: `tokensave_more` with that tool's area.
+    #[test]
+    fn rules_say_how_to_list_every_non_core_tool_they_name() {
+        use crate::mcp::tools::{tool_area, CORE_TOOLS, MORE_TOOL};
+        for agent in ["claude", "kiro", "omp", "auggie", "codex"] {
+            let body = expected_rules_markdown(agent).unwrap();
+            let named: std::collections::BTreeSet<&str> = body
+                .match_indices("tokensave_")
+                .map(|(at, _)| {
+                    let rest = &body[at..];
+                    let end = rest
+                        .find(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                        .unwrap_or(rest.len());
+                    &rest[..end]
+                })
+                .filter(|name| !CORE_TOOLS.contains(name) && *name != MORE_TOOL)
+                .collect();
+            assert!(!named.is_empty(), "{agent}: expected some non-core tool");
+            assert!(body.contains(MORE_TOOL), "{agent}: {MORE_TOOL} missing");
+            for name in named {
+                let area = tool_area(name);
+                assert!(
+                    body.contains(&format!("`{area}`")),
+                    "{agent}: {name} is in area {area}, which the rules do not name"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1218,6 +1288,79 @@ mod tests {
             "only one block should remain after collapsing duplicates"
         );
         assert!(contents.contains(BLOCK_END_MARKER));
+    }
+
+    /// Issue #621: refreshing an existing block must replace it where it is,
+    /// not remove it and append the new one at the end of the file — the
+    /// owner's text above and below the markers stays exactly where it was.
+    #[test]
+    fn write_rules_block_refreshes_in_place() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("copilot-instructions.md");
+        let stale_marker = block_start_marker("copilot", "stale");
+        let before = "# Project rules\n\nAbove the block.\n\n";
+        let after = "\n## Below the block\n\nMust stay below.\n\n\n  trailing  \n";
+        std::fs::write(
+            &path,
+            format!("{before}{stale_marker}\n\nstale\n\n{BLOCK_END_MARKER}\n{after}"),
+        )
+        .unwrap();
+
+        let body = expected_rules_markdown("copilot").unwrap();
+        assert!(write_rules_block(&path, "copilot", &body).unwrap());
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let new_marker = block_start_marker("copilot", &body);
+        assert_eq!(
+            contents,
+            format!("{before}{new_marker}\n\n{body}\n\n{BLOCK_END_MARKER}\n{after}"),
+            "content outside the markers must be preserved byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn write_rules_block_in_place_collapses_later_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let stale_marker = block_start_marker("droid", "stale");
+        let stale_block = format!("{stale_marker}\n\nstale\n\n{BLOCK_END_MARKER}\n");
+        std::fs::write(
+            &path,
+            format!("# Top\n\n{stale_block}\n# Middle\n\n{stale_block}\n# Bottom\n"),
+        )
+        .unwrap();
+        let body = expected_rules_markdown("droid").unwrap();
+        assert!(write_rules_block(&path, "droid", &body).unwrap());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches(BLOCK_START_PREFIX).count(), 1);
+        let block = contents.find(BLOCK_START_PREFIX).unwrap();
+        let middle = contents.find("# Middle").unwrap();
+        let bottom = contents.find("# Bottom").unwrap();
+        assert!(contents.starts_with("# Top\n\n"));
+        assert!(block < middle && middle < bottom);
+    }
+
+    #[test]
+    fn write_rules_block_in_place_still_migrates_legacy_heading_block() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let stale_marker = block_start_marker("droid", "stale");
+        std::fs::write(
+            &path,
+            format!(
+                "# Top\n\n{stale_marker}\n\nstale\n\n{BLOCK_END_MARKER}\n\n\
+                 ## Prefer tokensave MCP tools\n\nOld stale text.\n\n## Mine\n\nKeep.\n"
+            ),
+        )
+        .unwrap();
+        let body = expected_rules_markdown("droid").unwrap();
+        assert!(write_rules_block(&path, "droid", &body).unwrap());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let new_marker = block_start_marker("droid", &body);
+        assert_eq!(
+            contents,
+            format!("# Top\n\n{new_marker}\n\n{body}\n\n{BLOCK_END_MARKER}\n\n## Mine\n\nKeep.\n")
+        );
     }
 
     #[test]

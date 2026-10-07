@@ -273,6 +273,19 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     ag.install(&ctx).is_ok()
                 });
             if outcome.changed {
+                // #624: an upgrade also brings tokensave's section of hooks
+                // that are already installed up to this binary's shape, global
+                // and this repository's own, so a user who never runs
+                // `reinstall` is not left on the old one. Nothing is
+                // installed; only sections tokensave already wrote change.
+                // Every write names itself (#419), since the user did not ask
+                // for it.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                report_hook_refresh(&tokensave::agents::refresh_installed_git_hooks(
+                    &cwd,
+                    &current_bin_path(),
+                ));
+
                 // Refresh a tokensave-owned Claude rules file that exists on
                 // disk even when `claude` is not in `installed_agents` (#553).
                 // A user may register tokensave per project (`.mcp.json`) or
@@ -752,36 +765,59 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             let mut installed_names: Vec<String> = Vec::new();
             let mut removed_names: Vec<String> = Vec::new();
 
-            if let Some(id) = agent {
-                let ag = tokensave::agents::get_integration(&id)?;
-                let name = ag.name().to_string();
-                if local && !ag.supports_local() {
-                    return Err(tokensave::errors::TokenSaveError::Config {
-                        message: format!(
-                            "--local is not supported for \"{}\" — it has no project-scoped config. \
-                             Run a global install instead (omit --local).",
-                            ag.id()
-                        ),
-                    });
-                }
-                let ctx = tokensave::agents::InstallContext {
-                    home: home.clone(),
-                    tokensave_bin: tokensave_bin.clone(),
-                    tool_permissions: tokensave::agents::install_tool_perms(want_wildcard),
-                    scope: scope.clone(),
-                    force_permission_style,
-                };
-                ag.install(&ctx)?;
-                // A --local install is project-scoped; it must not touch the
-                // global installed-agents registry (which `reinstall` replays
-                // as global installs) or persist global user config.
-                if local {
-                    installed_names.push(name);
-                } else {
-                    if !user_cfg.installed_agents.contains(&id) {
-                        user_cfg.installed_agents.push(id);
-                        installed_names.push(name);
+            if !agent.is_empty() {
+                // Repeat `--agent` in a single run installs every named agent
+                // in turn (#640), in the order the user typed them. A repeated
+                // id (`--agent foo --agent foo`) is installed once.
+                let mut named_agents: Vec<String> = Vec::with_capacity(agent.len());
+                for id in agent {
+                    if !named_agents.contains(&id) {
+                        named_agents.push(id);
                     }
+                }
+                // Resolve and validate every agent before installing any, so a
+                // `--local` run naming an agent without project-scoped config
+                // fails up front instead of after earlier agents were installed.
+                let mut integrations = Vec::with_capacity(named_agents.len());
+                for id in &named_agents {
+                    let ag = tokensave::agents::get_integration(id)?;
+                    if local && !ag.supports_local() {
+                        return Err(tokensave::errors::TokenSaveError::Config {
+                            message: format!(
+                                "--local is not supported for \"{}\" — it has no project-scoped config. \
+                                 Run a global install instead (omit --local).",
+                                ag.id()
+                            ),
+                        });
+                    }
+                    integrations.push(ag);
+                }
+                let mut touched_global_cfg = false;
+                for (id, ag) in named_agents.iter().zip(integrations) {
+                    let name = ag.name().to_string();
+                    let ctx = tokensave::agents::InstallContext {
+                        home: home.clone(),
+                        tokensave_bin: tokensave_bin.clone(),
+                        tool_permissions: tokensave::agents::install_tool_perms(want_wildcard),
+                        scope: scope.clone(),
+                        force_permission_style,
+                    };
+                    ag.install(&ctx)?;
+                    // A --local install is project-scoped; it must not touch the
+                    // global installed-agents registry (which `reinstall`
+                    // replays as global installs) or persist global user
+                    // config.
+                    if local {
+                        installed_names.push(name);
+                    } else {
+                        if !user_cfg.installed_agents.contains(id) {
+                            user_cfg.installed_agents.push(id.clone());
+                            installed_names.push(name);
+                        }
+                        touched_global_cfg = true;
+                    }
+                }
+                if touched_global_cfg {
                     user_cfg.save();
                 }
             } else {
@@ -967,6 +1003,17 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     eprintln!("{warning}");
                 }
             }
+
+            // #624: hooks are not an agent, so the loop above never touched
+            // them, and the hook migrations an upgrade ships only reached a
+            // user who also ran `githooks on`. Refresh tokensave's section of
+            // hooks that are already installed — global ones, and this
+            // repository's own — without installing any that are not.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            report_hook_refresh(&tokensave::agents::refresh_installed_git_hooks(
+                &cwd,
+                &current_bin_path(),
+            ));
         }
         Commands::Uninstall {
             agent,
@@ -1124,43 +1171,72 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             let project_path = tokensave::config::resolve_path_with_discovery(path);
             // Track the first stdin line if we need to peek at `initialize` roots.
             let mut peeked_line: Option<String> = None;
+            // The registered projects, loaded at most once and only when
+            // discovery fails: every fallback below and a server with no
+            // default project read the same list (#606).
+            let mut registered: Option<Vec<serve::RegisteredProject>> = None;
             let cg = match serve::ensure_initialized(&project_path).await {
-                Ok(cg) => cg,
+                Ok(cg) => Some(cg),
+                // An explicit `--path` names the project to serve. A folder
+                // without an index gets no default project rather than
+                // whichever registered project a fallback would pick, which
+                // would answer about a project the host never asked for
+                // (#606).
+                Err(_) if explicit_path => None,
                 Err(_) => {
                     // A linked worktree outside its main checkout: the upward
                     // walk cannot reach the main index, so borrow it the way a
-                    // nested worktree would.
-                    let from_main_worktree = if explicit_path {
-                        None
-                    } else {
-                        serve::resolve_serve_from_main_worktree()
-                    };
-                    // Otherwise CWD-based discovery failed (e.g. VS Code
-                    // launched us from ~). Fall back to the global DB's
-                    // registered projects.
-                    let fallback = match from_main_worktree {
+                    // nested worktree would. Otherwise CWD-based discovery
+                    // failed (e.g. VS Code launched us from ~): fall back to
+                    // the global DB's registered projects, and last of all to
+                    // the MCP `initialize` roots (e.g. a VS Code multi-folder
+                    // workspace), read from the first stdin line.
+                    let fallback = match serve::resolve_serve_from_main_worktree() {
                         Some(p) => Some(p),
-                        None => serve::resolve_serve_from_global_db().await,
-                    };
-                    match fallback {
-                        Some(p) => serve::ensure_initialized(&p).await?,
                         None => {
-                            // Last resort: peek at the first stdin line for MCP
-                            // `initialize` roots (e.g. VS Code multi-folder workspace).
-                            match serve::resolve_serve_from_mcp_roots(&mut peeked_line).await {
-                                Some(p) => serve::ensure_initialized(&p).await?,
+                            let projects =
+                                registered.insert(serve::load_registered_projects().await);
+                            match serve::resolve_serve_from_global_db(projects) {
+                                Some(p) => Some(p),
                                 None => {
-                                    return Err(tokensave::errors::TokenSaveError::Config {
-                                        message: format!(
-                                            "no TokenSave index found at '{}' and no projects registered in the global database — run 'tokensave init' in your project first",
-                                            project_path.display()
-                                        ),
-                                    });
+                                    serve::resolve_serve_from_mcp_roots(&mut peeked_line, projects)
+                                        .await
                                 }
                             }
                         }
+                    };
+                    match fallback {
+                        Some(p) => Some(serve::ensure_initialized(&p).await?),
+                        None => None,
                     }
                 }
+            };
+            let Some(cg) = cg else {
+                // No project resolved (#606). Exiting here left the host with
+                // a failed server and the session with no tools at all,
+                // although `graph_root` still reaches every registered
+                // project. Serve with no default project.
+                eprintln!(
+                    "[tokensave] no TokenSave index found at '{}'; serving with no default \
+                     project — tool calls must pass graph_root",
+                    project_path.display()
+                );
+                let registered = match registered {
+                    Some(registered) => registered,
+                    None => serve::load_registered_projects().await,
+                };
+                let registered = registered
+                    .iter()
+                    .map(|project| project.path().to_string_lossy().into_owned())
+                    .collect();
+                // No index is open, so none of the per-project startup below
+                // applies: no scope warning, memory baseline, or server
+                // registry entry, which records which server holds which index.
+                tokensave::cancel::install_signal_handlers();
+                watch_for_orphaning();
+                let server = tokensave::mcp::McpServer::new_without_project(registered).await;
+                run_mcp_server(&server, timings, peeked_line, idle_timeout_secs).await?;
+                exit_after_serve();
             };
 
             // Set the shutdown flag the instant a signal arrives, rather than
@@ -1206,43 +1282,11 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             } else {
                 tokensave::mcp::McpServer::new(cg, scope_prefix).await
             };
-            server.set_timings_enabled(timings);
-            let mut transport = tokensave::mcp::StdioTransport::new();
-            // If we peeked at stdin to read `initialize` roots, replay that line.
-            if let Some(line) = peeked_line {
-                server.handle_and_write(&line, &mut transport).await;
-            }
-            server
-                .run_with_idle_timeout(
-                    &mut transport,
-                    idle_timeout_secs.map(std::time::Duration::from_secs),
-                )
-                .await?;
-            server.shutdown().await;
+            run_mcp_server(&server, timings, peeked_line, idle_timeout_secs).await?;
             // A hard kill skips this; that is what reaping on startup and on
             // read is for.
             tokensave::servers::unregister();
-            // Exit explicitly rather than unwinding out of `main` (#450/#436).
-            //
-            // `tokio::io::stdin()` performs its reads on a blocking thread,
-            // and a blocking task cannot be cancelled — so the outstanding
-            // read is still parked when the run loop leaves. Dropping the
-            // runtime waits for it, and under a supervisor that holds our
-            // stdin open it never completes: the server ran its whole
-            // graceful shutdown, printed its summary, and then sat there
-            // alive and unkillable by anything short of `SIGKILL`. That is
-            // the reported "kill did nothing" and the servers that "never
-            // exit" under a live parent.
-            //
-            // Shutdown has already persisted counters and checkpointed the
-            // WAL, and is idempotent, so there is nothing left to unwind for.
-            // Flush stdout first: a response written just before a signal
-            // must still reach the client.
-            {
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-            std::process::exit(0);
+            exit_after_serve();
         }
         Commands::Servers { json } => {
             let entries = tokensave::servers::list();
@@ -1847,6 +1891,31 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
     )
 }
 
+/// Print what `refresh_installed_git_hooks` changed (#624). Silent when
+/// nothing needed rewriting, so an up-to-date machine sees no output.
+fn report_hook_refresh(refresh: &tokensave::agents::HookRefresh) {
+    for path in &refresh.updated {
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Updated tokensave's section of the git hook at {} \
+             (your own content in that file was left untouched)",
+            path.display()
+        );
+    }
+    if !refresh.failed.is_empty() {
+        let names: Vec<String> = refresh
+            .failed
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        eprintln!(
+            "\x1b[33mwarning:\x1b[0m could not refresh git hooks: {}.\n  \
+             Run \x1b[1mtokensave githooks on\x1b[0m (or \x1b[1mgithooks on --local\x1b[0m \
+             inside the repository) to retry.",
+            names.join(", ")
+        );
+    }
+}
+
 /// Print what `remove_git_hooks` did. Says so explicitly when it found
 /// nothing, so `githooks off` never exits silently on a machine that has no
 /// tokensave hooks installed.
@@ -2097,7 +2166,7 @@ mod startup_tests {
     #[test]
     fn explicit_agent_config_commands_skip_agent_install_maintenance() {
         assert!(should_skip_agent_install_maintenance(&Commands::Install {
-            agent: Some("kiro".to_string()),
+            agent: vec!["kiro".to_string()],
             git_hook: tokensave::agents::GitHookMode::Default,
             local: false,
             wildcard_permissions: false,
@@ -2319,6 +2388,52 @@ fn watch_for_orphaning() {
 /// No reparenting signal to watch for off Unix.
 #[cfg(not(unix))]
 fn watch_for_orphaning() {}
+
+/// Runs a `serve` MCP server on stdio until the client leaves, the idle
+/// timeout passes, or a signal arrives, then shuts it down.
+///
+/// `peeked_line` is the first stdin line, when `serve` already read it to look
+/// for `initialize` roots; it is replayed so the server still answers it.
+async fn run_mcp_server(
+    server: &std::sync::Arc<tokensave::mcp::McpServer>,
+    timings: bool,
+    peeked_line: Option<String>,
+    idle_timeout_secs: Option<u64>,
+) -> tokensave::errors::Result<()> {
+    server.set_timings_enabled(timings);
+    let mut transport = tokensave::mcp::StdioTransport::new();
+    if let Some(line) = peeked_line {
+        server.handle_and_write(&line, &mut transport).await;
+    }
+    server
+        .run_with_idle_timeout(
+            &mut transport,
+            idle_timeout_secs.map(std::time::Duration::from_secs),
+        )
+        .await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Ends a `serve` process once its server has shut down.
+///
+/// Exits explicitly rather than unwinding out of `main` (#450/#436).
+/// `tokio::io::stdin()` performs its reads on a blocking thread, and a blocking
+/// task cannot be cancelled — so the outstanding read is still parked when the
+/// run loop leaves. Dropping the runtime waits for it, and under a supervisor
+/// that holds our stdin open it never completes: the server ran its whole
+/// graceful shutdown, printed its summary, and then sat there alive and
+/// unkillable by anything short of `SIGKILL`. That is the reported "kill did
+/// nothing" and the servers that "never exit" under a live parent.
+///
+/// Shutdown has already persisted counters and checkpointed the WAL, and is
+/// idempotent, so there is nothing left to unwind for. Stdout is flushed
+/// first: a response written just before a signal must still reach the client.
+fn exit_after_serve() -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(0);
+}
 
 #[cfg(test)]
 mod tests {

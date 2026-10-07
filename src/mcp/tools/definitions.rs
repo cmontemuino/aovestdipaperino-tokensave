@@ -163,6 +163,31 @@ pub fn is_graph_scoped_tool(definition: &ToolDefinition) -> bool {
         .unwrap_or(false)
 }
 
+/// Mark a tool that stays callable but is never sent in `tools/list`: an
+/// alias kept so existing callers and permission lists keep working while
+/// new callers see only its replacement.
+fn hidden(mut definition: ToolDefinition) -> ToolDefinition {
+    let Some(meta) = definition
+        .meta
+        .get_or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        panic!("tool metadata must be an object");
+    };
+    meta.insert("tokensave/hidden".to_string(), json!(true));
+    definition
+}
+
+/// Whether a tool is a hidden alias (see [`hidden`]).
+pub fn is_hidden_tool(definition: &ToolDefinition) -> bool {
+    definition
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("tokensave/hidden"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Mark a read-only local-graph tool that has no `graph_root`/`graph_branch`
 /// selectors, so the branch-drift gate refuses it once the served branch has
 /// drifted. Deriving the refused set from this marker (instead of a
@@ -266,6 +291,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         def_delete_symbol(),
         def_replace_lines(),
         def_ast_grep_rewrite(),
+        def_rename(),
         graph_scoped(def_gini()),
         graph_scoped(def_dependency_depth()),
         graph_scoped(def_health()),
@@ -388,7 +414,7 @@ pub const TOOL_AREAS: &[(&str, &str, &[&str])] = &[
     ),
     (
         "edit",
-        "symbol-level and line-level edits, ast-grep rewrite, rename preview",
+        "symbol-level and line-level edits, ast-grep rewrite, graph-based rename",
         &[
             "tokensave_insert_at",
             "tokensave_delete_symbol",
@@ -396,7 +422,7 @@ pub const TOOL_AREAS: &[(&str, &str, &[&str])] = &[
             "tokensave_ast_grep_rewrite",
             "tokensave_replace_symbol",
             "tokensave_insert_at_symbol",
-            "tokensave_rename_preview",
+            "tokensave_rename",
         ],
     ),
     (
@@ -445,9 +471,42 @@ pub fn tool_area(name: &str) -> &'static str {
         .map_or("navigate", |(area, _, _)| area)
 }
 
+/// A tool name for a hint in a tool result, with how to list it when the core
+/// toolset hides it (#576): `tokensave_doc (via tokensave_more area
+/// "navigate" if not listed)`. A core tool is returned as is.
+pub fn reachable_tool_name(name: &str) -> String {
+    if CORE_TOOLS.contains(&name) {
+        return name.to_string();
+    }
+    format!(
+        "{name} (via {MORE_TOOL} area \"{}\" if not listed)",
+        tool_area(name)
+    )
+}
+
 /// True when `area` is `"all"` or the name of an entry in [`TOOL_AREAS`].
 pub fn is_tool_area(area: &str) -> bool {
     area == "all" || TOOL_AREAS.iter().any(|(name, _, _)| *name == area)
+}
+
+/// The `initialize` instructions sentence for the core toolset (#576): which
+/// tools are listed, and which areas [`MORE_TOOL`] can add.
+///
+/// A client that defers tool schemas (Claude Code) shows the model the server
+/// instructions before any schema, so this map is how a session learns that a
+/// tool it was told to use, such as `tokensave_node`, is one call away. It is
+/// sent once per session, not once per turn.
+pub fn core_toolset_instructions() -> String {
+    use std::fmt::Write;
+    let mut text = format!(
+        " Only the core tools are listed: {}. To list more, call {MORE_TOOL} with an area:",
+        CORE_TOOLS.join(", ")
+    );
+    for (area, summary, _) in TOOL_AREAS {
+        let _ = write!(text, " {area} ({summary}),");
+    }
+    text.push_str(" or all.");
+    text
 }
 
 fn def_more() -> ToolDefinition {
@@ -476,6 +535,18 @@ fn def_more() -> ToolDefinition {
     )
 }
 
+/// Every tool an agent can be granted at install time: all of
+/// [`get_tool_definitions`] plus [`MORE_TOOL`].
+///
+/// `tokensave_more` is not in [`get_tool_definitions`] because the full
+/// toolset never lists it, but the core toolset is the default (#576), so a
+/// permission list without it prompts on the first call that lists more tools.
+pub fn get_installable_tool_definitions() -> Vec<ToolDefinition> {
+    let mut definitions = get_tool_definitions();
+    definitions.push(def_more());
+    definitions
+}
+
 /// Returns the tool definitions that `tools/list` sends for `toolset`.
 ///
 /// [`get_tool_definitions`] stays the source of truth for everything else
@@ -490,6 +561,7 @@ pub fn get_listed_tool_definitions(
     revealed_areas: &std::collections::BTreeSet<String>,
 ) -> Vec<ToolDefinition> {
     let mut definitions = get_tool_definitions();
+    definitions.retain(|d| !is_hidden_tool(d));
     if toolset == crate::config::Toolset::Full {
         return definitions;
     }
@@ -580,7 +652,7 @@ fn def_search() -> ToolDefinition {
                 },
                 "literal": {
                     "type": "boolean",
-                    "description": "Exact-substring search over source text (for runtime error strings); returns file/line locations instead of ranked symbols. Case-sensitive. Default false."
+                    "description": "Exact-substring search over source text (for runtime error strings); returns file/line locations instead of ranked symbols, plus `total` matches and `truncated` when `limit` cut the list. Case-sensitive. Default false."
                 },
                 "format": {
                     "type": "string",
@@ -589,7 +661,7 @@ fn def_search() -> ToolDefinition {
                 },
                 "ids": {
                     "type": "boolean",
-                    "description": "Include node IDs / enclosing IDs in results. Default false; pass true when you plan a follow-up call."
+                    "description": "Include node IDs / enclosing IDs in results (both formats). Default false; pass true when you plan a follow-up call."
                 }
             },
             "required": ["query"]
@@ -1170,20 +1242,83 @@ fn def_similar() -> ToolDefinition {
     )
 }
 
+/// Hidden alias kept for callers of the pre-#568 tool: dispatches to
+/// `tokensave_rename` with `dry_run` forced on. Not sent in `tools/list`
+/// (see [`is_hidden_tool`]), but still a known tool for dispatch,
+/// permission lists and `tokensave tool`.
 fn def_rename_preview() -> ToolDefinition {
-    def(
+    hidden(def(
         "tokensave_rename_preview",
-        "References",
-        "Show all references to a symbol -- all edges where the node appears as source or target.",
+        "Rename Preview",
+        "Deprecated alias of tokensave_rename with dry_run=true: lists the rename sites of a \
+         symbol with their confidence class, without editing.",
         json!({
             "type": "object",
             "properties": {
                 "node_id": {
                     "type": "string",
-                    "description": "The unique node ID to find references for"
+                    "description": "The unique node ID to find rename sites for"
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "Optional new name, to include a diff preview"
                 }
             },
             "required": ["node_id"]
+        }),
+    ))
+}
+
+/// The `tokensave_rename` description. States what the tool is not, so a
+/// caller does not read a binding-aware guarantee into it (#568).
+pub const RENAME_DESCRIPTION: &str = "Rename a symbol at its definition and every reference \
+     the code graph records. Graph-based, NOT binding-aware: references come from a name-based \
+     resolver, not scope rules, so shadowing, dynamic calls or `**kwargs` can be missed. Each \
+     site has a class: `exact` = bound by a qualified path, typed receiver, import, or a name \
+     no other symbol has, located to one token; `heuristic` = a name fallback (`recv.method` \
+     tail, scoring among same-named candidates, blocklisted names, build variants), an \
+     override paired by name, or a token not distinguishable on its line; `ambiguous` = a call \
+     the resolver could not decide; `text_only` = a whole-word mention the graph does not link \
+     (comment, string, doc, unlinked identifier). Only indexed files are scanned. dry_run \
+     (default true) returns sites by file, counts per class and a unified diff. Applying \
+     refuses while any site is heuristic or ambiguous, or an unlinked identifier exists, unless \
+     allow_heuristic=true; ambiguous and text_only sites are never edited. All-or-nothing: \
+     every changed file must re-parse without new errors; keywords and same-scope collisions \
+     are refused.";
+
+fn def_rename() -> ToolDefinition {
+    def_rw(
+        "tokensave_rename",
+        "Rename Symbol",
+        RENAME_DESCRIPTION,
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "Node ID of the symbol to rename. Either this or `symbol`."
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name or qualified name, resolved like tokensave_replace_symbol (callables win a tie; still ambiguous is refused)."
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "The new identifier. Required to apply; optional for a dry run."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Return the plan and diff without editing. Default true."
+                },
+                "allow_heuristic": {
+                    "type": "boolean",
+                    "description": "Also edit heuristic sites, instead of refusing while any exist. Default false."
+                },
+                "project_root": {
+                    "type": "string",
+                    "description": "Optional absolute directory to resolve the index-relative file paths against instead of the indexed project root, e.g. a checkout with the same layout. Alias: `cwd`."
+                }
+            }
         }),
     )
 }
@@ -1225,7 +1360,7 @@ fn def_rank() -> ToolDefinition {
             "properties": {
                 "edge_kind": {
                     "type": "string",
-                    "enum": ["implements", "extends", "calls", "uses", "contains", "annotates", "derives_macro", "instantiates"],
+                    "enum": ["implements", "extends", "calls", "uses", "contains", "annotates", "derives_macro", "instantiates", "reopens"],
                     "description": "The relationship type to rank by (e.g. 'implements' to find most-implemented interfaces)"
                 },
                 "direction": {
@@ -2294,25 +2429,32 @@ fn def_body() -> ToolDefinition {
         "Symbol Body",
         "Return the full source body of a symbol by name (function, struct, const, etc.). \
          Collapses search + node lookup + file read into a single call. \
-         When the name is ambiguous, returns multiple matches ranked by relevance.",
+         Returns a body only when exactly one definition matches; when the name is \
+         ambiguous (e.g. several methods named `RefreshAsync`), returns no body but a \
+         candidate list (qualified name, kind, file, line range, node id) — re-call with \
+         a qualified name such as `Type::Member` / `Type.Member`, or with `node_id`. \
+         A function or type definition outranks a same-named field or import.",
         json!({
             "type": "object",
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "Symbol name to look up (e.g. 'resolve_provider_api_key', 'CCH_SEED', 'GraphStats'). Qualified names are also accepted."
+                    "description": "Symbol name to look up (e.g. 'resolve_provider_api_key', 'GraphStats'). Qualify it to disambiguate: 'Coordinator::RefreshAsync', 'Coordinator.RefreshAsync' and 'App.Coordinator.RefreshAsync' all work (trailing segments are matched)."
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "Node id of the symbol (from a candidate list, tokensave_search, or tokensave_context). Takes precedence over `symbol`."
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Maximum number of matching bodies to return when the name is ambiguous (default: 3, max: 20)"
+                    "description": "Maximum number of candidates listed when the name is ambiguous (default: 20, max: 50)"
                 },
                 "format": {
                     "type": "string",
                     "enum": ["text", "json"],
                     "description": "Output format. 'text' returns raw source with a short header (no JSON escaping); 'json' returns the structured object. Default 'text'."
                 }
-            },
-            "required": ["symbol"]
+            }
         }),
     )
 }
@@ -2743,12 +2885,15 @@ fn def_read() -> ToolDefinition {
         "tokensave_read",
         "Read File (mode-aware)",
         "Read a file or its symbol map. Modes: 'full' (entire file), 'lines' \
-         (1-based inclusive byte-range slice via the 'lines' arg, e.g. '120-180'), \
+         (1-based inclusive line-range slice via the 'lines' arg, e.g. '120-180'), \
          'map' (flat list of every top-level symbol from the graph — no source \
          bytes touched), 'signatures' (functions and types with their cached \
-         signature). Cross-session cached: a re-call on an unchanged file returns \
-         a tiny stub with 'unchanged: true'. Pass 'force': true to bypass the \
-         cache and always receive the body.",
+         signature). 'full' and 'lines' number every line like the Read tool: \
+         right-aligned real file line number, a tab, then the line (a 'lines' \
+         slice from 120 starts at 120). The body is always returned, with a \
+         'digest' of it. To skip re-sending content you still hold, pass that \
+         digest as 'if_digest': when it matches the current body for the same \
+         mode and range, a tiny stub with 'unchanged: true' is returned instead.",
         json!({
             "type": "object",
             "properties": {
@@ -2765,9 +2910,13 @@ fn def_read() -> ToolDefinition {
                     "type": "string",
                     "description": "Required when mode='lines'. Format 'A-B' or single 'A' (1-based, inclusive). E.g. '120-180' or '42'."
                 },
+                "if_digest": {
+                    "type": "string",
+                    "description": "Digest from an earlier tokensave_read response with the same mode and range that you still hold. If it matches the current content, an 'unchanged: true' stub is returned instead of the body; otherwise the body is returned. Omit to always get the body."
+                },
                 "force": {
                     "type": "boolean",
-                    "description": "Bypass the cross-session cache and return the body even when an unchanged stub would otherwise be served. Default false."
+                    "description": "Deprecated: the body is now always returned unless 'if_digest' matches. When true, 'if_digest' is ignored. Default false."
                 },
                 "format": {
                     "type": "string",
@@ -3075,6 +3224,7 @@ mod tests {
             "tokensave_delete_symbol",
             "tokensave_dependencies",
             "tokensave_diff",
+            "tokensave_rename",
             "tokensave_insert_at",
             "tokensave_insert_at_symbol",
             "tokensave_log",
@@ -3117,6 +3267,21 @@ mod tests {
         }
     }
 
+    /// #576: a hint naming a hidden tool says which area lists it; a core tool
+    /// needs no such note.
+    #[test]
+    fn a_hint_names_the_area_that_lists_a_hidden_tool() {
+        assert_eq!(
+            reachable_tool_name("tokensave_doc"),
+            "tokensave_doc (via tokensave_more area \"navigate\" if not listed)"
+        );
+        assert_eq!(
+            reachable_tool_name("tokensave_blame"),
+            "tokensave_blame (via tokensave_more area \"git\" if not listed)"
+        );
+        assert_eq!(reachable_tool_name("tokensave_search"), "tokensave_search");
+    }
+
     /// #576: the core toolset lists exactly `CORE_TOOLS`, every name in it is a
     /// real tool, and it keeps every tool the instructions point an agent at.
     #[test]
@@ -3139,9 +3304,13 @@ mod tests {
                 definition.name
             );
         }
+        // Hidden aliases (`tokensave_rename_preview`) are dispatched but
+        // never listed.
+        let listed = all.iter().filter(|d| !is_hidden_tool(d)).count();
+        assert!(listed < all.len());
         assert_eq!(
             get_listed_tool_definitions(Toolset::Full, &none).len(),
-            all.len()
+            listed
         );
     }
 
@@ -3179,11 +3348,12 @@ mod tests {
             assert!(listed.iter().any(|d| d.name == MORE_TOOL));
             total += listed.len() - CORE_TOOLS.len() - 1;
         }
-        assert_eq!(total, all.len(), "the areas must reach every tool once");
+        let listable = all.iter().filter(|d| !is_hidden_tool(d)).count();
+        assert_eq!(total, listable, "the areas must reach every tool once");
 
         let everything = BTreeSet::from(["all".to_string()]);
         let listed = get_listed_tool_definitions(Toolset::Core, &everything);
-        assert_eq!(listed.len(), all.len());
+        assert_eq!(listed.len(), listable);
         assert!(listed.iter().all(|d| d.name != MORE_TOOL));
     }
 

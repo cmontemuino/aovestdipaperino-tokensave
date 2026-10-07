@@ -146,16 +146,23 @@ pub(crate) fn get_opt_string_lossy(
 
 /// Maps a row from the `edges` table to an `Edge`.
 ///
-/// Expected column order: source(0), target(1), kind(2), line(3).
+/// Expected column order: source(0), target(1), kind(2), line(3), and
+/// optionally `resolved_by`(4). A query that selects only the first four
+/// columns maps to `resolved_by: None`, as does a NULL or unknown code.
 pub(crate) fn row_to_edge(row: &libsql::Row) -> std::result::Result<Edge, libsql::Error> {
     let kind_str = row.get::<String>(2)?;
     let line = row.get::<Option<u32>>(3)?;
+    let resolved_by = match row.get_value(4) {
+        Ok(libsql::Value::Integer(code)) => ResolvedBy::from_code(code),
+        _ => None,
+    };
 
     Ok(Edge {
         source: row.get::<String>(0)?,
         target: row.get::<String>(1)?,
         kind: EdgeKind::from_str(&kind_str).unwrap_or(EdgeKind::Uses),
         line,
+        resolved_by,
     })
 }
 
@@ -323,7 +330,7 @@ pub(crate) fn display_language_for_path(path: &str) -> &'static str {
         "cs" => "C#",
         "fs" | "fsi" | "fsx" => "F#",
         "fst" | "fsti" => "F*",
-        "rb" => "Ruby",
+        "rb" | "rake" | "erb" | "slim" => "Ruby",
         "php" => "PHP",
         "dart" => "Dart",
         "lua" => "Lua",
